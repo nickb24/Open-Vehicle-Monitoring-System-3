@@ -581,17 +581,8 @@ void OvmsVehicleVWeGolf::IncomingFrameCan3(CAN_frame_t* p_frame) {
             StandardMetrics.ms_v_env_cabinsetpoint->SetValue(
                 tmp_f32);  // working            // Cabin setpoint temperature [°C]
 
-            tmp_u8 = ((uint8_t)(d[7] & 0x20) >> 5) |
-                     0;                /// Faktor 1 Offset 0, Minimum 0, Maximum 1 [] Initial 0
-            tmp_u8 = (uint8_t)tmp_u8;  // 0x0 no rear window heating 0x1 rear window heating
-            // if(tmp_u8 == 0x1)
-            // {
-            //   //
-            // }
-            // else
-            // {
-            //   //
-            // }
+            // 0x0 no rear window heating 0x1 rear window heating (bit 5). Logged below with the front bit.
+            const bool rear_window_heat = (d[7] & 0x20) != 0;
 
             tmp_u8 = ((uint8_t)(d[7] & 0x40) >> 6) |
                      0;                /// Faktor 1 Offset 0, Minimum 0, Maximum 1 [] Initial 0
@@ -609,6 +600,17 @@ void OvmsVehicleVWeGolf::IncomingFrameCan3(CAN_frame_t* p_frame) {
             // operation2 heater bit while climate runs; not set by the dashboard heater button.
             tmp_u8 = ((uint8_t)(d[7] & 0x80) >> 7);
             m_env_heated_front_window->SetValue(tmp_u8 == 0x1);
+
+            // TEST BRANCH: log the window heating bits on change (front bit 7 as the known-working
+            // reference for the unconfirmed rear bit 5).
+            {
+                const uint8_t win = (uint8_t)(tmp_u8 | (rear_window_heat ? 0x02 : 0x00));
+                if (win != m_win_heat_last) {
+                    m_win_heat_last = win;
+                    ESP_LOGI(TAG, "0x594 window heating: front %s, rear %s (d[7] 0x%02x)",
+                             (win & 0x01) ? "on" : "off", (win & 0x02) ? "on" : "off", d[7]);
+                }
+            }
 
             // ESP_LOGV(TAG, "0x0594 charging=%d timer=%d type=%s setpoint=%.1f°C",
                      // StdMetrics.ms_v_charge_inprogress->AsBool(),

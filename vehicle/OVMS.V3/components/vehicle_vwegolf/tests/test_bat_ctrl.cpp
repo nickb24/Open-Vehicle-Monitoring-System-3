@@ -1207,6 +1207,32 @@ void test_climate_arm_keeps_seat_bits() {
     delete v;
 }
 
+// TEST BRANCH: the ClimateState (0x12) change log is passive — with no command in flight it transmits
+// nothing and touches no metric, and during a climate start it doesn't swallow the sequence. The log
+// lines themselves are checked by eye in the test output (idle, then running; the repeat is not logged).
+void test_climate_state_logged_passively() {
+    printf("\ntest_climate_state_logged_passively\n");
+    g_metrics = MetricStore{};
+    auto* v = new OvmsVehicleVWeGolf();
+    const std::vector<uint8_t> idle    = {0x00, 0x00, 0x00, 0x0a, 0x00, 0xbb, 0x00};  // clim-a
+    const std::vector<uint8_t> running = {0x11, 0x00, 0x00, 0x0a, 0x00, 0xcb, 0x00};  // clim-b
+
+    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, idle);     // logged
+    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, idle);     // unchanged: not logged
+    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, running);  // logged
+    CHECK(ext_frames(kcan(v), BAP_CMD_ID).empty(), "no command: ClimateState log transmits nothing");
+    CHECK(!hvac_on(), "ClimateState log does not set HVAC (0x58 echo / 0x5EA stay the sources)");
+
+    v->CommandClimateControl(true);
+    advance_to_profile_phase(v);
+    kcan(v)->tx_log.clear();
+    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, running);  // logged: first of this command
+    inject_bap_status(v, bap::egolf::FUNC_PROFILES_ARRAY, make_profile0_array(0x06));
+    CHECK(sent_trigger(kcan(v)), "climate start still triggers with ClimateState frames interleaved");
+
+    delete v;
+}
+
 // SAFETY chokepoint: a profile-set write must hard-cap maxCurrent at 0x20 even when the read-back byte
 // is garbled above the limit and the edit does NOT touch current (a value >0x20 bricks charging).
 void test_set_profile_hard_caps_current() {
@@ -1501,6 +1527,7 @@ void test_bat_ctrl_all() {
     test_set_profile_seats_off();
     test_set_profile_rear_window();
     test_climate_arm_keeps_seat_bits();
+    test_climate_state_logged_passively();
     test_set_profile_hard_caps_current();
     test_set_profile_truncated_name_aborts();
     test_set_profile_guards();

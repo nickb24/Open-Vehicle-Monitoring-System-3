@@ -25,7 +25,8 @@
 
 #include "vehicle_vwegolf_bat_ctrl.h"
 
-#include <cstdio>  // snprintf — compose the per-operation failure notification
+#include <cstdio>   // snprintf — compose the per-operation failure notification
+#include <cstring>  // memcmp / memcpy — ClimateState change log
 
 #include "metrics_standard.h"
 #include "ovms_log.h"
@@ -371,7 +372,10 @@ void VWeGolfBatteryControl::IncomingBapStatus(const CAN_frame_t* p_frame) {
     // 4 pending slots occupied, and the 21-frame profile-array (49 59) reply's continuations get
     // misrouted so it never completes on the 2nd+ command — short frames still complete (so the GET
     // still goes out), but the profile is never read and the command times out.
-    if (!m_bcu_seen) m_bap_asm.reset();
+    if (!m_bcu_seen) {
+        m_bap_asm.reset();
+        m_cs_last_len = 0;  // log the first ClimateState of each command, even if unchanged
+    }
     m_bcu_seen = true;
 
     const uint8_t* d = p_frame->data.u8;
@@ -387,6 +391,13 @@ void VWeGolfBatteryControl::IncomingBapStatus(const CAN_frame_t* p_frame) {
     if ((el.opcode == bap::OP_STATUS || el.opcode == bap::OP_HEARTBEAT) &&
         (el.func == bap::egolf::FUNC_TIMER_STATE || bap::egolf::timerSlotForFunc(el.func) != 0)) {
         UpdateTimerCache(el);
+    }
+
+    // TEST BRANCH: log every change of the ClimateState (func 0x12) status / heartbeat, in any phase
+    // and with no command in flight, so remote seat / window heating can be checked from the log.
+    if ((el.opcode == bap::OP_STATUS || el.opcode == bap::OP_HEARTBEAT) &&
+        el.func == bap::egolf::FUNC_CLIMATE_STATE) {
+        LogClimateState(el);
     }
 
     // The OperationMode echo "49 58 <flag>" is the immediate-operation on/off state — reflect it on
@@ -651,6 +662,57 @@ void VWeGolfBatteryControl::IncomingBapStatus(const CAN_frame_t* p_frame) {
         }
         return;
     }
+}
+
+// ClimateState (func 0x12) state names, DSI numbering (on-car: 2 / 11 / 12 seen on the wire). The
+// seatheaterWindowState enum uses the same numbers for the values it shares, so one table serves both
+// nibbles. 5 is not defined in the firmware.
+static const char* vwe_climate_state_name(uint8_t s) {
+    static const char* const names[16] = {
+        "init",                     "aborted: car body open",      "aborted: ignition on",
+        "aborted: park heater fuel", "aborted: park heater time",  "?",
+        "aborted: no ext supply",   "aborted: device error",       "aborted: battery condition",
+        "aborted: battery charging", "aborted: battery low",       "idle",
+        "running",                  "aborted: not in park",        "aborted: power reduction",
+        "completed",
+    };
+    return names[s & 0x0F];
+}
+
+void VWeGolfBatteryControl::LogClimateState(const bap::Element& el) {
+    // TEST BRANCH: one line per change of the BCU's 7-byte ClimateState. Decoded from the 2026-10-16
+    // captures: byte 0 = climateMode bits (0x01 climating, 0x02 auto defrost, 0x04 heating, 0x08
+    // cooling, 0x10 ventilation; 0x11 and 0x05 seen); byte 5 = climateState (high nibble) |
+    // seatheaterWindowState (low nibble). Byte 6 should carry the seat / window heater bits, but has
+    // never been seen non-zero, so it is printed raw. Bytes 1-4 have only ever read 00 00 0a 00.
+    if (el.body == nullptr || el.bodyLen == 0) return;
+    const uint8_t n = el.bodyLen < sizeof(m_cs_last) ? (uint8_t)el.bodyLen : (uint8_t)sizeof(m_cs_last);
+    if (n == m_cs_last_len && memcmp(el.body, m_cs_last, n) == 0) return;  // unchanged
+    memcpy(m_cs_last, el.body, n);
+    m_cs_last_len = n;
+
+    char hex[3 * sizeof(m_cs_last) + 1] = "";
+    size_t hl = 0;
+    for (uint8_t i = 0; i < n; i++)
+        hl += snprintf(hex + hl, sizeof(hex) - hl, i ? " %02x" : "%02x", el.body[i]);
+    const char* kind = el.opcode == bap::OP_HEARTBEAT ? "hb" : "status";
+    if (el.bodyLen < 7) {
+        ESP_LOGI(TAG, "ClimateState 0x12 (%s): %s (short: %u bytes)", kind, hex, (unsigned)el.bodyLen);
+        return;
+    }
+
+    const uint8_t m = el.body[0];
+    char mode[48];
+    int ml = snprintf(mode, sizeof(mode), "%s%s%s%s%s",
+                      (m & 0x01) ? "climating " : "", (m & 0x02) ? "defrost " : "",
+                      (m & 0x04) ? "heating " : "",   (m & 0x08) ? "cooling " : "",
+                      (m & 0x10) ? "ventilation " : "");
+    if (ml > 0) mode[ml - 1] = '\0';
+    else snprintf(mode, sizeof(mode), "-");
+
+    const uint8_t cs = el.body[5] >> 4, sw = el.body[5] & 0x0F;
+    ESP_LOGI(TAG, "ClimateState 0x12 (%s): %s | climate %u %s | seat/window %u %s | mode 0x%02x %s | heaters 0x%02x",
+             kind, hex, cs, vwe_climate_state_name(cs), sw, vwe_climate_state_name(sw), m, mode, el.body[6]);
 }
 
 void VWeGolfBatteryControl::UpdateTimerCache(const bap::Element& el) {

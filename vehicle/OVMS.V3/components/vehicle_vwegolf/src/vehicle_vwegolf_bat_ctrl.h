@@ -243,6 +243,8 @@ class VWeGolfBatteryControl {
     // Timer STATUS/HEARTBEAT handler: drive the in-flight timer command off the (already-updated) cache
     // — write once the enable mask is known, confirm on the 49 53 echo, finish a list. RX task only.
     void HandleTimerStatus(const bap::Element& el);
+    // TEST BRANCH: log one line per change of the ClimateState (func 0x12) status/heartbeat. RX task only.
+    void LogClimateState(const bap::Element& el);
     // If BC_TIMER_LIST and the cache holds the mask + every slot, publish it (instant list). CP_PROFILE only.
     void TimerListMaybeComplete();
     // If BC_TIMER_SET/ENABLE and the enable mask is cached, RMW-write now (record + mask) and go to
@@ -300,6 +302,10 @@ class VWeGolfBatteryControl {
     bool     m_timer_write_record = false;          // SET writes a record; ENABLE does not
     bool     m_timer_enable     = false;            // desired enabled state of the target slot
     uint8_t  m_timer_target_mask = 0;               // the enable mask we wrote (confirm when it echoes)
+
+    // TEST BRANCH: last logged ClimateState body (LogClimateState logs only on change). RX task only.
+    uint8_t  m_cs_last[8]  = {};
+    uint8_t  m_cs_last_len = 0;   // 0 = nothing logged yet (reset at the start of each command)
 
     ClimatePhase m_phase       = CP_IDLE;
     BcOp    m_op            = BC_CLIMATE;  // which operation the in-flight command performs
