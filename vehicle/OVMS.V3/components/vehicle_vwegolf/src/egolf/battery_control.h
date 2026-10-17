@@ -88,6 +88,16 @@ enum ProfileOperation : uint8_t {
   PO_CHARGING      = 0x01,  // charge at this location
   PO_CLIMATE       = 0x02,  // climatise (preconditioning)
   PO_ALLOW_BATTERY = 0x04,  // climatise without external supply (use HV battery)
+  // Upper bits per the MIB2 firmware (org.dsi.ifc.carhybrid.BatteryControlProfileOperation field
+  // order: charge, climate, climateWithoutExternalSupply, autoDefrost, seatHeaterFrontLeft,
+  // seatHeaterFrontRight, seatHeaterRearLeft, seatHeaterRearRight). [FW, not yet WIRE-confirmed]
+  PO_AUTO_DEFROST  = 0x08,  // automatic defrost (never set by this module)
+  PO_SEAT_FL       = 0x10,  // seat heater front left
+  PO_SEAT_FR       = 0x20,  // seat heater front right
+  PO_SEAT_RL       = 0x40,  // seat heater rear left   (protocol only; never sent by this module)
+  PO_SEAT_RR       = 0x80,  // seat heater rear right  (protocol only; never sent by this module)
+  PO_SEAT_MASK     = 0xF0,  // all four seat bits (a seats write clears any stray rear bits too)
+  PO_SEAT_FRONT    = PO_SEAT_FL | PO_SEAT_FR,
 };
 
 // ⚠⚠ HARD SAFETY LIMIT — the BCU must NEVER be written a maxCurrent above 0x20 (32 A). A higher

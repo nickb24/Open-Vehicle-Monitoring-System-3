@@ -938,6 +938,22 @@ bool VWeGolfBatteryControl::SendProfileSetWrite() {
         }
     }
 
+    // Set/clear ONLY the rear window heater bit of operation2; keep its other bits (RMW).
+    if (e.fields & ProfileEdit::F_REAR_WINDOW) {
+        if (e.heatedRearWindow) {
+            p.operation2 |= bap::egolf::PO2_WINDOW_HEATER_REAR;
+        } else {
+            p.operation2 &= (uint8_t)~bap::egolf::PO2_WINDOW_HEATER_REAR;
+        }
+    }
+
+    // Replace ONLY the four seat-heater bits of operation (upper nibble); keep the charge/climate/
+    // on-battery/defrost bits (RMW). SendArm() only touches the low bits, so the seat bits stored here
+    // apply to every climate start until changed — same model as the window heater bits.
+    if (e.fields & ProfileEdit::F_SEATS)
+        p.operation = (uint8_t)((p.operation & ~bap::egolf::PO_SEAT_MASK) |
+                                (e.seatHeaters & bap::egolf::PO_SEAT_MASK));
+
     // ⚠ HARD SAFETY CLAMP (see kMaxCurrentHardLimit): NEVER write a maxCurrent above 0x20 — a higher
     // value bricks the car's charging until a factory reset. Guards both an F_CURRENT value and a
     // preserved/garbled read-back byte, exactly like SendArm().

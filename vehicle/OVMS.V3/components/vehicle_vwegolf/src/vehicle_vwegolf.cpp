@@ -77,15 +77,16 @@ OvmsVehicleVWeGolf::OvmsVehicleVWeGolf() {
             CommandListProfiles(writer);
         });
     // `set` writes selected fields of ONE profile (read-modify-write, no charge/climate trigger). The
-    // valid fields differ per profile: profile 0 "Optionen" = current / minsoc / temp / frontwindow;
-    // charge locations 1-3 = flags / current / soc. min 3 args (profile + one field/value); max 9
-    // (profile + 4 pairs).
+    // valid fields differ per profile: profile 0 "Optionen" = current / minsoc / temp / frontwindow /
+    // rearwindow / seats; charge locations 1-3 = flags / current / soc. min 3 args (profile + one
+    // field/value); max 13 (profile + 6 pairs).
     cmd_profile->RegisterCommand(
         "set", "Set fields of a charge profile",
         [this](int, OvmsWriter* writer, OvmsCommand*, int argc, const char* const* argv) {
             CommandSetProfile(writer, argc, argv);
         },
-        "<profile 0-3> <field value>...  (0: current/minsoc/temp/frontwindow; 1-3: flags/current/soc)", 3, 9);
+        "<profile 0-3> <field value>...  (0: current/minsoc/temp/frontwindow/rearwindow/seats; 1-3: flags/current/soc)",
+        3, 13);
 
     // Departure timers (recurring). list = read-only; set/enable/disable/clear write to the car
     // (on 0x17332501, like climate/charge). A timer binds to a charge profile by index -> its target SoC.
@@ -1120,19 +1121,32 @@ void OvmsVehicleVWeGolf::CommandListProfiles(OvmsWriter* writer) {
     bap::egolf::Profile profs[VWeGolfBatteryControl::kMaxProfiles];
     uint8_t n = m_batctrl.GetProfiles(profs, VWeGolfBatteryControl::kMaxProfiles);
     writer->printf("Charge profiles (%u):\n", (unsigned)n);
-    // Flags column is wide enough for "chg cli bat fw".
-    writer->printf("  #  %-16s  Op    %-14s  MaxA  MinSoC  TgtSoC  Temp\n", "Name", "Flags");
+    // Flags column is wide enough for "chg cli bat fw rw"; Seats lists the heated seats (FL/FR).
+    writer->printf("  #  %-16s  Op    %-17s  %-5s  MaxA  MinSoC  TgtSoC  Temp\n", "Name", "Flags", "Seats");
     for (uint8_t i = 0; i < n; i++) {
         const bap::egolf::Profile& p = profs[i];
         // Operation flags — the WIRE-confirmed bits: charge / climate / climatise-on-battery, plus the
-        // operation2 front window heater bit (fw).
+        // operation2 front (fw) and rear (rw) window heater bits.
         char flags[24];
-        snprintf(flags, sizeof(flags), "%s%s%s%s",
-                 (p.operation & bap::egolf::PO_CHARGING)      ? "chg " : "",
-                 (p.operation & bap::egolf::PO_CLIMATE)       ? "cli " : "",
-                 (p.operation & bap::egolf::PO_ALLOW_BATTERY) ? "bat " : "",
-                 (p.operation2 & bap::egolf::PO2_WINDOW_HEATER_FRONT) ? "fw" : "");
+        int fl = snprintf(flags, sizeof(flags), "%s%s%s%s%s",
+                          (p.operation & bap::egolf::PO_CHARGING)      ? "chg " : "",
+                          (p.operation & bap::egolf::PO_CLIMATE)       ? "cli " : "",
+                          (p.operation & bap::egolf::PO_ALLOW_BATTERY) ? "bat " : "",
+                          (p.operation2 & bap::egolf::PO2_WINDOW_HEATER_FRONT) ? "fw " : "",
+                          (p.operation2 & bap::egolf::PO2_WINDOW_HEATER_REAR)  ? "rw " : "");
+        if (fl > 0) flags[fl - 1] = '\0';  // drop the trailing space
         if (flags[0] == '\0') { flags[0] = '-'; flags[1] = '\0'; }
+
+        // Seat heaters (operation upper nibble) — firmware-derived bits, shown so a write can be checked.
+        // Rear bits are never sent, but are shown if the car reports them.
+        char seats[16];
+        int sl = snprintf(seats, sizeof(seats), "%s%s%s%s",
+                          (p.operation & bap::egolf::PO_SEAT_FL) ? "FL " : "",
+                          (p.operation & bap::egolf::PO_SEAT_FR) ? "FR " : "",
+                          (p.operation & bap::egolf::PO_SEAT_RL) ? "RL " : "",
+                          (p.operation & bap::egolf::PO_SEAT_RR) ? "RR " : "");
+        if (sl > 0) seats[sl - 1] = '\0';
+        if (seats[0] == '\0') { seats[0] = '-'; seats[1] = '\0'; }
 
         // A 0 byte = "not set for this profile". minChargeLevel (MinSoC) is meaningful on the global
         // profile 0; targetChargeLevel (TgtSoC) on the charge locations 1-3 — the raw bytes reproduce
@@ -1146,9 +1160,9 @@ void OvmsVehicleVWeGolf::CommandListProfiles(OvmsWriter* writer) {
             snprintf(temp, sizeof(temp), "%.1fC", bap::egolf::rawToTemp(p.temperatureRaw));
         else snprintf(temp, sizeof(temp), "-");
 
-        writer->printf("  %u  %-16s  0x%02x  %-14s  %-4s  %-6s  %-6s  %s\n",
+        writer->printf("  %u  %-16s  0x%02x  %-17s  %-5s  %-4s  %-6s  %-6s  %s\n",
                        (unsigned)p.position, p.name[0] ? p.name : "(unnamed)", p.operation, flags,
-                       maxc, minc, tgtc, temp);
+                       seats, maxc, minc, tgtc, temp);
     }
 }
 
@@ -1262,15 +1276,47 @@ static bool vwe_parse_op_flags(const char* s, uint8_t& op) {
     return op != 0;
 }
 
+// Parse an on/off value ("on"/"1"/"true" | "off"/"0"/"false"). Returns false if unrecognized.
+static bool vwe_parse_onoff(const char* s, bool& on) {
+    if (vwe_ciequal(s, "on") || vwe_ciequal(s, "1") || vwe_ciequal(s, "true"))   { on = true;  return true; }
+    if (vwe_ciequal(s, "off") || vwe_ciequal(s, "0") || vwe_ciequal(s, "false")) { on = false; return true; }
+    return false;
+}
+
+// Parse a seat-heater value ("off" | "front"/"on", or "fl" / "fr" / "fl,fr") into PO_SEAT_* bits. Only
+// the front seats are offered (the e-Golf has front seat heating only). "off"/"none" yields 0 (all seat
+// heating off). Returns false if anything is unrecognized.
+static bool vwe_parse_seats(const char* s, uint8_t& seats) {
+    seats = 0;
+    if (vwe_ciequal(s, "off") || vwe_ciequal(s, "none") || vwe_ciequal(s, "0")) return true;
+    if (vwe_ciequal(s, "front") || vwe_ciequal(s, "on")) { seats = bap::egolf::PO_SEAT_FRONT; return true; }
+    char buf[48];
+    size_t j = 0;
+    for (size_t i = 0; s[i] && j + 1 < sizeof(buf); i++) buf[j++] = s[i];
+    buf[j] = '\0';
+    for (char* tok = buf; tok && *tok;) {
+        char* comma = strchr(tok, ',');
+        if (comma) *comma = '\0';
+        if (vwe_ciequal(tok, "fl")) seats |= bap::egolf::PO_SEAT_FL;
+        else if (vwe_ciequal(tok, "fr")) seats |= bap::egolf::PO_SEAT_FR;
+        else return false;  // an unrecognized token invalidates the whole value
+        tok = comma ? comma + 1 : nullptr;
+    }
+    return seats != 0;
+}
+
 void OvmsVehicleVWeGolf::CommandSetProfile(OvmsWriter* writer, int argc, const char* const* argv) {
     // xvg charge profile set <profile 0-3> <field value>...   (read-modify-write, no charge/climate trigger)
     // The valid fields differ per profile (see the per-profile guards below): profile 0 "Optionen" =
-    // current / minsoc / temp / frontwindow; charge locations 1-3 = flags / current / soc.
+    // current / minsoc / temp / frontwindow / rearwindow / seats; charge locations 1-3 = flags / current /
+    // soc.
     if (argc < 3 || (argc - 1) % 2 != 0) {
         writer->puts("Usage: xvg charge profile set <profile 0-3> <field value>...");
         writer->puts("  profile 0 (Optionen):     current <A> | minsoc <%> | temp <C> | frontwindow|fw <on|off>");
+        writer->puts("                            rearwindow|rw <on|off> | seats <off|front|fl|fr>");
         writer->puts("  profiles 1-3 (locations): flags <charge|climate|both> | current <A> | soc <%>");
         writer->puts("  e.g. 'set 1 soc 80 current 13'   'set 0 minsoc 20 temp 21.0'   'set 2 flags both'   'set 0 fw on'");
+        writer->puts("       'set 0 seats front rw on'   'set 0 seats off'");
         return;
     }
     int pos = atoi(argv[0]);
@@ -1326,15 +1372,22 @@ void OvmsVehicleVWeGolf::CommandSetProfile(OvmsWriter* writer, int argc, const c
             edit.fields |= PE::F_OP;
         } else if (vwe_ciequal(f, "frontwindow") || vwe_ciequal(f, "fw")) {
             if (!isGlobal) { writer->puts("frontwindow applies only to profile 0 (Optionen)."); return; }
-            if (vwe_ciequal(v, "on") || vwe_ciequal(v, "1") || vwe_ciequal(v, "true"))
-                edit.heatedFrontWindow = true;
-            else if (vwe_ciequal(v, "off") || vwe_ciequal(v, "0") || vwe_ciequal(v, "false"))
-                edit.heatedFrontWindow = false;
-            else { writer->puts("frontwindow: on | off."); return; }
+            if (!vwe_parse_onoff(v, edit.heatedFrontWindow)) { writer->puts("frontwindow: on | off."); return; }
             edit.fields |= PE::F_FRONT_WINDOW;
+        } else if (vwe_ciequal(f, "rearwindow") || vwe_ciequal(f, "rw")) {
+            if (!isGlobal) { writer->puts("rearwindow applies only to profile 0 (Optionen)."); return; }
+            if (!vwe_parse_onoff(v, edit.heatedRearWindow)) { writer->puts("rearwindow: on | off."); return; }
+            edit.fields |= PE::F_REAR_WINDOW;
+        } else if (vwe_ciequal(f, "seats") || vwe_ciequal(f, "seat")) {
+            if (!isGlobal) { writer->puts("seats applies only to profile 0 (Optionen)."); return; }
+            if (!vwe_parse_seats(v, edit.seatHeaters)) {
+                writer->puts("seats: off | front | fl | fr  (or fl,fr).");
+                return;
+            }
+            edit.fields |= PE::F_SEATS;
         } else {
             writer->printf("Unknown field '%s'.\n", f);
-            writer->puts(isGlobal ? "Profile 0 fields: current, minsoc, temp, frontwindow."
+            writer->puts(isGlobal ? "Profile 0 fields: current, minsoc, temp, frontwindow, rearwindow, seats."
                                   : "Location fields: flags, current, soc.");
             return;
         }
