@@ -525,6 +525,154 @@ bap::SendResult sendClimateSequence(Sink&& sink, bool on) {
   return sendClimate(sink, on);
 }
 
+// ---------------------------------------------------------------------------
+// Status properties: PlugState (0x10), ChargeState (0x11), ClimateState (0x12)
+// ---------------------------------------------------------------------------
+// Passive decode of the BCU's status / heartbeat broadcasts on 0x17332510 (and of the copies inside a
+// GetAll reply). State numbers are the MIB2 firmware's DSI enum values, which is what the wire carries
+// [WIRE: ClimateState 2 / 11 / 12]. Nibble pairs are high nibble first; boolean bitsets are LSB-first,
+// like the profile operation byte. The *Name() helpers below mark a value "(unconfirmed)" when it is a
+// firmware name that has not yet been seen on the wire in the matching car state.
+
+// ClimateState (func 0x12), 7 bytes [WIRE]:
+//   [0]   climateMode bits (ClimateMode)
+//   [1-4] not decoded (always 00 00 0a 00 so far; [3] = 10 is probably the session length in minutes)
+//   [5]   climateState (high nibble, ClimateStateValue) | seatheaterWindowState (low nibble, same numbers)
+//   [6]   seat / window heater bits (ClimateHeater)
+constexpr uint16_t kClimateStateLen = 7;
+
+enum ClimateMode : uint8_t {
+  CM_CLIMATING    = 0x01,  // [WIRE]
+  CM_DEFROST      = 0x02,  // [FW]
+  CM_HEATING      = 0x04,  // [WIRE]
+  CM_COOLING      = 0x08,  // [FW]
+  CM_VENTILATION  = 0x10,  // [WIRE]
+  CM_FUEL_HEATING = 0x20,  // [FW] fuel-based heater (no e-Golf has one)
+};
+
+enum ClimateHeater : uint8_t {
+  CH_SEAT_FL      = 0x01,  // [FW]
+  CH_SEAT_FR      = 0x02,  // [FW]
+  CH_SEAT_RL      = 0x04,  // [FW]
+  CH_SEAT_RR      = 0x08,  // [FW]
+  CH_WINDOW_FRONT = 0x10,  // [WIRE] windscreen heating running
+  CH_WINDOW_REAR  = 0x20,  // [FW]
+};
+
+enum ClimateStateValue : uint8_t {
+  CS_INIT                    = 0,
+  CS_ABORT_BODY_OPEN         = 1,
+  CS_ABORT_IGNITION_ON       = 2,   // [WIRE] accessory mode / car in use
+  CS_ABORT_NO_FUEL           = 3,
+  CS_ABORT_HEATER_MAX_TIME   = 4,
+  CS_ABORT_NO_EXT_SUPPLY     = 6,
+  CS_ABORT_DEVICE_ERROR      = 7,
+  CS_ABORT_BATTERY_CONDITION = 8,
+  CS_ABORT_BATTERY_CHARGING  = 9,
+  CS_ABORT_BATTERY_LOW       = 10,
+  CS_IDLE                    = 11,  // [WIRE]
+  CS_RUNNING                 = 12,  // [WIRE]
+  CS_ABORT_NOT_IN_PARK       = 13,
+  CS_ABORT_POWER_REDUCTION   = 14,
+  CS_COMPLETED               = 15,
+};
+
+struct ClimateState {
+  uint8_t mode = 0;         // [0] ClimateMode bits
+  uint8_t state = 0;        // [5] high nibble: ClimateStateValue
+  uint8_t heaterState = 0;  // [5] low nibble: seatheaterWindowState (ClimateStateValue numbers)
+  uint8_t heaters = 0;      // [6] ClimateHeater bits
+};
+inline bool decodeClimateState(const uint8_t* b, uint16_t len, ClimateState& out) {
+  if (len < kClimateStateLen) return false;
+  out = ClimateState();
+  out.mode = b[0];
+  out.state = (uint8_t)(b[5] >> 4);
+  out.heaterState = (uint8_t)(b[5] & 0x0F);
+  out.heaters = b[6];
+  return true;
+}
+// A climate state that means "refused or stopped for a reason": everything except init, idle, running,
+// completed and 5 (undefined in the firmware).
+inline bool climateStateIsAbort(uint8_t s) {
+  return s != CS_INIT && s != 5 && s != CS_IDLE && s != CS_RUNNING && s != CS_COMPLETED;
+}
+
+// ChargeState (func 0x11), 9 bytes [WIRE]:
+//   [0]   chargeMode (high nibble, ChargeModeValue) | chargeState (low nibble, ChargeStateValue)
+//   [1]   SOC % (0xFF = unknown, e.g. right after wake) [WIRE: matched the car at 82 % and 62 %]
+//   [2-8] not decoded (ff ff ff ff 00 ff 01 when not charging)
+constexpr uint16_t kChargeStateMinLen = 2;
+
+enum ChargeModeValue : uint8_t {
+  CHM_OFF = 0, CHM_AC = 1, CHM_DC = 2, CHM_CONDITIONING = 3, CHM_AC_CONDITIONING = 4,
+  CHM_DC_CONDITIONING = 5, CHM_INIT = 15,
+};
+enum ChargeStateValue : uint8_t {
+  CHS_INIT = 0, CHS_IDLE = 1, CHS_RUNNING = 2, CHS_CONSERVATION = 3, CHS_ABORT_TEMP_LOW = 6,
+  CHS_ABORT_DEVICE_ERROR = 7, CHS_ABORT_NO_SUPPLY = 11, CHS_ABORT_NOT_IN_PARK = 12, CHS_COMPLETED = 15,
+};
+
+struct ChargeState {
+  uint8_t mode = 0;     // ChargeModeValue
+  uint8_t state = 0;    // ChargeStateValue
+  uint8_t soc = 0xFF;   // %, 0xFF = unknown
+};
+inline bool decodeChargeState(const uint8_t* b, uint16_t len, ChargeState& out) {
+  if (len < kChargeStateMinLen) return false;
+  out = ChargeState();
+  out.mode = (uint8_t)(b[0] >> 4);
+  out.state = (uint8_t)(b[0] & 0x0F);
+  out.soc = b[1];
+  return true;
+}
+inline bool chargeStateIsAbort(uint8_t s) {
+  return s == CHS_ABORT_TEMP_LOW || s == CHS_ABORT_DEVICE_ERROR || s == CHS_ABORT_NO_SUPPLY ||
+         s == CHS_ABORT_NOT_IN_PARK;
+}
+
+// PlugState (func 0x10), 2 bytes [WIRE: "0f 00" = unplugged]:
+//   [0] lockSetup (high nibble: 0 unlocked, 1 locked) | lockState (low nibble: 2 auto-lock error,
+//       3 unlock error, 15 no error)
+//   [1] supplyState (high nibble: 0 inactive, 1 active, 2 charging station connected) |
+//       plugState (low nibble: 0 unplugged, 1 plugged); 15 = init in every field
+constexpr uint16_t kPlugStateLen = 2;
+
+struct PlugState {
+  uint8_t lockSetup = 15, lockState = 15, supplyState = 15, plugState = 15;
+};
+inline bool decodePlugState(const uint8_t* b, uint16_t len, PlugState& out) {
+  if (len < kPlugStateLen) return false;
+  out.lockSetup = (uint8_t)(b[0] >> 4);
+  out.lockState = (uint8_t)(b[0] & 0x0F);
+  out.supplyState = (uint8_t)(b[1] >> 4);
+  out.plugState = (uint8_t)(b[1] & 0x0F);
+  return true;
+}
+inline bool plugLockIsError(uint8_t lockState) { return lockState == 2 || lockState == 3; }
+
+// Value -> text, written into `out` (always NUL-terminated): "name", "name (unconfirmed)", or
+// "unknown (N)". The bitset variants list the set bits comma-separated ("none" if no bit is set).
+// Return the string length (truncated to cap - 1).
+size_t climateStateName(uint8_t v, char* out, size_t cap);
+size_t heaterStateName(uint8_t v, char* out, size_t cap);
+size_t climateModeNames(uint8_t bits, char* out, size_t cap);
+size_t climateHeaterNames(uint8_t bits, char* out, size_t cap);
+size_t chargeModeName(uint8_t v, char* out, size_t cap);
+size_t chargeStateName(uint8_t v, char* out, size_t cap);
+size_t plugLockSetupName(uint8_t v, char* out, size_t cap);
+size_t plugLockStateName(uint8_t v, char* out, size_t cap);
+size_t plugSupplyName(uint8_t v, char* out, size_t cap);
+size_t plugStateName(uint8_t v, char* out, size_t cap);
+
+// GetAll (func 0x01) reply: every property value in function order, concatenated. Values longer than
+// 6 bytes carry a u16le length prefix; shorter ones are fixed-size [WIRE: the 79-byte reply of
+// 2026-10-16/18]. Finds `func`'s value (*val / *vlen). Returns false unless the whole body parses
+// exactly against this BCU's property list (0x02-0x04, 0x0D-0x16), so a BCU with a different list is
+// ignored rather than misread.
+bool findGetAllValue(const uint8_t* body, uint16_t len, uint8_t func, const uint8_t** val,
+                     uint16_t* vlen);
+
 }  // namespace egolf
 }  // namespace bap
 

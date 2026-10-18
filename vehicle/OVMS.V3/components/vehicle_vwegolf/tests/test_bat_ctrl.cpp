@@ -1207,26 +1207,243 @@ void test_climate_arm_keeps_seat_bits() {
     delete v;
 }
 
-// TEST BRANCH: the ClimateState (0x12) change log is passive — with no command in flight it transmits
-// nothing and touches no metric, and during a climate start it doesn't swallow the sequence. The log
-// lines themselves are checked by eye in the test output (idle, then running; the repeat is not logged).
-void test_climate_state_logged_passively() {
-    printf("\ntest_climate_state_logged_passively\n");
+// ---------------------------------------------------------------------------
+// TEST BRANCH: passive BCU status decode — PlugState 0x10 / ChargeState 0x11 / ClimateState 0x12
+// ---------------------------------------------------------------------------
+
+static std::string str_metric(const char* name) { return g_metrics.strings[name]; }
+static bool bool_metric(const char* name) { return g_metrics.numbers[name] != 0.0; }
+
+// Real bodies from the 2026-10-16/18 captures.
+static const std::vector<uint8_t> kCsIdle     = {0x00, 0x00, 0x00, 0x0a, 0x00, 0xbb, 0x00};  // clim-a
+static const std::vector<uint8_t> kCsIgnition = {0x00, 0x00, 0x00, 0x0a, 0x00, 0x2b, 0x00};  // bap25-1
+static const std::vector<uint8_t> kCsRunning  = {0x11, 0x00, 0x00, 0x0a, 0x00, 0xcb, 0x00};  // clim-b
+static const std::vector<uint8_t> kCsWindow   = {0x11, 0x00, 0x00, 0x0a, 0x00, 0xcc, 0x10};  // klima-b
+// The 79-byte GetAll reply at wake (fw-bug, 2026-10-18).
+static const std::vector<uint8_t> kGetAll = {
+    0x03, 0x00, 0x25, 0x00, 0x04, 0x00,                                // 0x02 BAP_Config
+    0x08, 0x00, 0x78, 0x07, 0xfe, 0xe0, 0x00, 0x00, 0x00, 0x00,        // 0x03 FunctionList (len 8)
+    0x0a,                                                              // 0x04 heartbeat
+    0x00,                                                              // 0x0D
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,                                // 0x0E FSG_Setup
+    0x00,                                                              // 0x0F
+    0x0f, 0x00,                                                        // 0x10 PlugState
+    0x09, 0x00, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0xff, 0x01,  // 0x11 ChargeState (len 9)
+    0x07, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0xbb, 0x00,              // 0x12 ClimateState (len 7)
+    0x03, 0x00,                                                        // 0x13 TimerState
+    0x08, 0x00, 0xff, 0xff, 0xff, 0x08, 0x1e, 0x3e, 0x01, 0x00,        // 0x14 timer 1
+    0x08, 0x00, 0xff, 0xff, 0xff, 0x09, 0x00, 0xc0, 0x03, 0x00,        // 0x15 timer 2
+    0x08, 0x00, 0x1a, 0x08, 0x08, 0x10, 0x05, 0x01, 0x02, 0x00,        // 0x16 timer 3
+};
+
+// Pure decoders and names: confirmed values plain, firmware-only values "(unconfirmed)", undefined
+// values "unknown (N)".
+void test_status_decoders_and_names() {
+    printf("\ntest_status_decoders_and_names\n");
+    using namespace bap::egolf;
+    char s[160];
+
+    ClimateState cs;
+    CHECK(decodeClimateState(kCsWindow.data(), (uint16_t)kCsWindow.size(), cs), "ClimateState decodes");
+    CHECK(cs.mode == 0x11 && cs.state == CS_RUNNING && cs.heaterState == CS_RUNNING &&
+          cs.heaters == CH_WINDOW_FRONT, "ClimateState fields: mode / state / heater state / heaters");
+    CHECK(!decodeClimateState(kCsWindow.data(), 6, cs), "short ClimateState refused");
+
+    climateStateName(CS_RUNNING, s, sizeof(s));
+    CHECK(strcmp(s, "running") == 0, "climate 12 = running");
+    climateStateName(CS_ABORT_BATTERY_LOW, s, sizeof(s));
+    CHECK(strcmp(s, "aborted: battery low (unconfirmed)") == 0, "climate 10 = battery low (unconfirmed)");
+    climateStateName(5, s, sizeof(s));
+    CHECK(strcmp(s, "unknown (5)") == 0, "climate 5 = unknown (5)");
+    climateModeNames(0x11, s, sizeof(s));
+    CHECK(strcmp(s, "climating,ventilation") == 0, "mode 0x11 = climating,ventilation");
+    climateModeNames(0x0a, s, sizeof(s));
+    CHECK(strcmp(s, "defrost (unconfirmed),cooling (unconfirmed)") == 0, "mode 0x0a = unconfirmed bits");
+    climateModeNames(0x00, s, sizeof(s));
+    CHECK(strcmp(s, "none") == 0, "mode 0x00 = none");
+    climateModeNames(0x84, s, sizeof(s));
+    CHECK(strcmp(s, "heating,unknown bits 0x80") == 0, "mode with an undefined bit");
+    climateHeaterNames(0x13, s, sizeof(s));
+    CHECK(strcmp(s, "seat front left (unconfirmed),seat front right (unconfirmed),front window") == 0,
+          "heaters 0x13 = FL + FR (unconfirmed) + front window");
+    climateHeaterNames(0x13, s, 12);
+    CHECK(strlen(s) == 11, "names truncate safely to the buffer");
+
+    ChargeState chs;
+    const uint8_t cb[] = {0x31, 0x3e};
+    CHECK(decodeChargeState(cb, 2, chs) && chs.mode == CHM_CONDITIONING && chs.state == CHS_IDLE &&
+          chs.soc == 62, "ChargeState 31 3e = conditioning / idle / 62 %");
+    chargeModeName(CHM_CONDITIONING, s, sizeof(s));
+    CHECK(strcmp(s, "conditioning") == 0, "charge mode 3 = conditioning");
+    chargeStateName(CHS_ABORT_NO_SUPPLY, s, sizeof(s));
+    CHECK(strcmp(s, "aborted: power supply not available (unconfirmed)") == 0, "charge state 11 name");
+
+    PlugState ps;
+    const uint8_t pb[] = {0x0f, 0x00};
+    CHECK(decodePlugState(pb, 2, ps) && ps.lockSetup == 0 && ps.lockState == 15 && ps.supplyState == 0 &&
+          ps.plugState == 0, "PlugState 0f 00 = unlocked / no error / inactive / unplugged");
+    plugStateName(1, s, sizeof(s));
+    CHECK(strcmp(s, "plugged (unconfirmed)") == 0, "plug 1 = plugged (unconfirmed)");
+
+    // GetAll split against the real 79-byte reply.
+    const uint8_t* val = nullptr;
+    uint16_t vlen = 0;
+    CHECK(kGetAll.size() == 79, "GetAll fixture is 79 bytes");
+    CHECK(findGetAllValue(kGetAll.data(), (uint16_t)kGetAll.size(), FUNC_CLIMATE_STATE, &val, &vlen) &&
+          vlen == 7 && memcmp(val, kCsIdle.data(), 7) == 0, "GetAll: ClimateState found");
+    CHECK(findGetAllValue(kGetAll.data(), (uint16_t)kGetAll.size(), FUNC_CHARGE_STATE, &val, &vlen) &&
+          vlen == 9 && val[0] == 0x01 && val[1] == 0xff, "GetAll: ChargeState found");
+    CHECK(findGetAllValue(kGetAll.data(), (uint16_t)kGetAll.size(), FUNC_PLUG_STATE, &val, &vlen) &&
+          vlen == 2 && val[0] == 0x0f, "GetAll: PlugState found");
+    CHECK(!findGetAllValue(kGetAll.data(), 78, FUNC_CLIMATE_STATE, &val, &vlen),
+          "GetAll: a truncated body is refused");
+    std::vector<uint8_t> longer = kGetAll;
+    longer.push_back(0x00);
+    CHECK(!findGetAllValue(longer.data(), (uint16_t)longer.size(), FUNC_CLIMATE_STATE, &val, &vlen),
+          "GetAll: a body with a different layout is refused");
+}
+
+// ClimateState -> metrics: state / mode / heaters, the standard heating / cooling flags, the windscreen
+// metric, the raw bytes. Passive: no TX.
+void test_climate_state_metrics() {
+    printf("\ntest_climate_state_metrics\n");
     g_metrics = MetricStore{};
     auto* v = new OvmsVehicleVWeGolf();
-    const std::vector<uint8_t> idle    = {0x00, 0x00, 0x00, 0x0a, 0x00, 0xbb, 0x00};  // clim-a
-    const std::vector<uint8_t> running = {0x11, 0x00, 0x00, 0x0a, 0x00, 0xcb, 0x00};  // clim-b
 
-    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, idle);     // logged
-    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, idle);     // unchanged: not logged
-    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, running);  // logged
-    CHECK(ext_frames(kcan(v), BAP_CMD_ID).empty(), "no command: ClimateState log transmits nothing");
-    CHECK(!hvac_on(), "ClimateState log does not set HVAC (0x58 echo / 0x5EA stay the sources)");
+    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, kCsIdle);
+    CHECK(str_metric("xvg.v.env.climate.state") == "idle", "idle -> state 'idle'");
+    CHECK(str_metric("xvg.v.env.climate.mode") == "none", "idle -> mode 'none'");
+    CHECK(str_metric("xvg.v.env.climate.raw") == "00 00 00 0a 00 bb 00", "raw bytes published");
 
+    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, {0x05, 0x00, 0x00, 0x0a, 0x00, 0xcb, 0x00});
+    CHECK(str_metric("xvg.v.env.climate.state") == "running", "running -> state 'running'");
+    CHECK(str_metric("xvg.v.env.climate.mode") == "climating,heating", "mode 0x05 = climating,heating");
+    CHECK(bool_metric("ms_v_env_heating") && !bool_metric("ms_v_env_cooling"), "v.e.heating on, cooling off");
+
+    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, {0x09, 0x00, 0x00, 0x0a, 0x00, 0xcb, 0x00});
+    CHECK(!bool_metric("ms_v_env_heating") && bool_metric("ms_v_env_cooling"), "mode 0x09: v.e.cooling on");
+
+    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, kCsWindow);
+    CHECK(bool_metric("xvg.v.env.heated_front_window"), "heater bit 0x10 -> heated_front_window on");
+    CHECK(str_metric("xvg.v.env.climate.heaters") == "front window", "heaters = 'front window'");
+    CHECK(str_metric("xvg.v.env.climate.heaterstate") == "running", "seat/window state = 'running'");
+
+    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, kCsRunning);
+    CHECK(!bool_metric("xvg.v.env.heated_front_window"), "heater bit clear -> heated_front_window off");
+    CHECK(ext_frames(kcan(v), BAP_CMD_ID).empty(), "passive decode transmits nothing");
+
+    delete v;
+}
+
+// v.e.hvac: the fresh BCU ClimateState owns it during a BCU climate session (running / idle / aborted);
+// the clima ECU bit (0x5EA) decides when the car is in use ("ignition on") or ClimateState is stale.
+void test_climate_state_owns_hvac() {
+    printf("\ntest_climate_state_owns_hvac\n");
+    g_metrics = MetricStore{};
+    auto* v = new OvmsVehicleVWeGolf();
+    auto ecu_on  = make_kcan_frame(v, 0x5EA, {0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00});
+    auto ecu_off = make_kcan_frame(v, 0x5EA, {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00});
+
+    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, kCsRunning);
+    CHECK(hvac_on(), "ClimateState running -> v.e.hvac on");
+    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, kCsIdle);
+    CHECK(!hvac_on(), "ClimateState idle -> v.e.hvac off at once");
+    v->IncomingFrameCan3(&ecu_on);
+    CHECK(!hvac_on(), "fresh BCU idle: the 0x5EA bit does not override it");
+
+    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, kCsIgnition);
+    v->IncomingFrameCan3(&ecu_on);
+    CHECK(hvac_on(), "'ignition on' (car in use): the 0x5EA bit decides");
+    v->IncomingFrameCan3(&ecu_off);
+    CHECK(!hvac_on(), "'ignition on': 0x5EA bit off -> v.e.hvac off");
+
+    // Stale: no ClimateState for > 30 s while the bus stays awake -> 0x5EA decides again.
+    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, kCsIdle);
+    for (int i = 0; i < 31; i++) {
+        v->IncomingFrameCan3(&ecu_off);  // keeps the bus alive
+        call_ticker1(v, i);
+    }
+    v->IncomingFrameCan3(&ecu_on);
+    CHECK(hvac_on(), "stale ClimateState (31 s): the 0x5EA bit decides");
+
+    delete v;
+}
+
+// Notifications fire on an observed transition into an abort value, once. The normal end of a remote
+// session (driver switches on / opens a door) and a stale abort state at wake stay quiet.
+void test_status_abort_notifications() {
+    printf("\ntest_status_abort_notifications\n");
+    g_metrics = MetricStore{};
+    MyNotify = OvmsNotify{};
+    auto* v = new OvmsVehicleVWeGolf();
+    const std::vector<uint8_t> battLow = {0x00, 0x00, 0x00, 0x0a, 0x00, 0xab, 0x00};
+
+    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, battLow);
+    CHECK(MyNotify.count == 0, "first state seen (no transition): no notification");
+    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, kCsRunning);
+    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, battLow);
+    CHECK(MyNotify.count == 1 && MyNotify.last_subtype == "xvg.climate", "running -> battery low notifies");
+    CHECK(MyNotify.last_value == "Climate stopped: aborted: battery low (unconfirmed)", "climate abort text");
+    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, battLow);
+    CHECK(MyNotify.count == 1, "repeat of the same state: no second notification");
+
+    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, kCsIdle);
+    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, battLow);
+    CHECK(MyNotify.count == 2 && MyNotify.last_value == "Climate not started: aborted: battery low (unconfirmed)",
+          "idle -> battery low: 'not started'");
+    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, kCsRunning);
+    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, kCsIgnition);
+    CHECK(MyNotify.count == 2, "running -> ignition on (driver got in): no notification");
+
+    // ChargeState: running (AC) -> power supply not available.
+    inject_bap_status(v, bap::egolf::FUNC_CHARGE_STATE, {0x12, 0x3e, 0xff, 0xff, 0xff, 0xff, 0x00, 0xff, 0x01});
+    CHECK(str_metric("xvg.v.c.bcu.mode") == "AC (unconfirmed)" &&
+          str_metric("xvg.v.c.bcu.state") == "running (unconfirmed)", "charge mode / state metrics");
+    inject_bap_status(v, bap::egolf::FUNC_CHARGE_STATE, {0x1b, 0x3e, 0xff, 0xff, 0xff, 0xff, 0x00, 0xff, 0x01});
+    CHECK(MyNotify.count == 3 && MyNotify.last_subtype == "xvg.charge" &&
+          MyNotify.last_value == "Charging stopped: aborted: power supply not available (unconfirmed)",
+          "charge running -> no supply notifies");
+
+    // PlugState: locked + plugged, then an unlock error.
+    inject_bap_status(v, bap::egolf::FUNC_PLUG_STATE, {0x1f, 0x11});
+    CHECK(str_metric("xvg.v.c.plug.state") == "plugged (unconfirmed)" &&
+          str_metric("xvg.v.c.plug.lock") == "locked (unconfirmed)" &&
+          str_metric("xvg.v.c.plug.lockerror") == "no error", "plug metrics");
+    inject_bap_status(v, bap::egolf::FUNC_PLUG_STATE, {0x13, 0x11});
+    CHECK(MyNotify.count == 4 && MyNotify.last_value == "Charge port lock: unlock error (unconfirmed)",
+          "plug unlock error notifies");
+
+    delete v;
+}
+
+// The GetAll reply that answers every channel open carries all three properties: the state is known
+// right at wake. The bus going to sleep then sets "no data" and clears the running flags.
+void test_status_from_getall_and_sleep() {
+    printf("\ntest_status_from_getall_and_sleep\n");
+    g_metrics = MetricStore{};
+    auto* v = new OvmsVehicleVWeGolf();
+
+    inject_bap_status(v, bap::egolf::FUNC_BAP_GETALL, kGetAll);
+    CHECK(str_metric("xvg.v.env.climate.state") == "idle", "GetAll -> climate state 'idle'");
+    CHECK(str_metric("xvg.v.c.bcu.mode") == "off" && str_metric("xvg.v.c.bcu.state") == "idle",
+          "GetAll -> charge mode 'off', state 'idle'");
+    CHECK(str_metric("xvg.v.c.plug.state") == "unplugged" && str_metric("xvg.v.c.plug.supply") == "inactive",
+          "GetAll -> plug 'unplugged', supply 'inactive'");
+
+    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, kCsWindow);
+    CHECK(hvac_on() && bool_metric("xvg.v.env.heated_front_window"), "running with windscreen");
+    for (int i = 0; i <= 10; i++) call_ticker1(v, i);  // no frames: the bus goes to sleep
+    CHECK(str_metric("xvg.v.env.climate.state") == "no data" && str_metric("xvg.v.c.plug.state") == "no data",
+          "asleep -> 'no data'");
+    CHECK(!hvac_on() && !bool_metric("xvg.v.env.heated_front_window") && !bool_metric("ms_v_env_heating"),
+          "asleep -> hvac / windscreen / heating off");
+    CHECK(str_metric("xvg.v.env.climate.raw") == "11 00 00 0a 00 cc 10", "raw keeps the last bytes seen");
+
+    // A climate start still runs with ClimateState frames interleaved.
     v->CommandClimateControl(true);
     advance_to_profile_phase(v);
     kcan(v)->tx_log.clear();
-    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, running);  // logged: first of this command
+    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, kCsIdle);
     inject_bap_status(v, bap::egolf::FUNC_PROFILES_ARRAY, make_profile0_array(0x06));
     CHECK(sent_trigger(kcan(v)), "climate start still triggers with ClimateState frames interleaved");
 
@@ -1527,7 +1744,12 @@ void test_bat_ctrl_all() {
     test_set_profile_seats_off();
     test_set_profile_rear_window();
     test_climate_arm_keeps_seat_bits();
-    test_climate_state_logged_passively();
+    // passive BCU status decode (PlugState / ChargeState / ClimateState)
+    test_status_decoders_and_names();
+    test_climate_state_metrics();
+    test_climate_state_owns_hvac();
+    test_status_abort_notifications();
+    test_status_from_getall_and_sleep();
     test_set_profile_hard_caps_current();
     test_set_profile_truncated_name_aborts();
     test_set_profile_guards();

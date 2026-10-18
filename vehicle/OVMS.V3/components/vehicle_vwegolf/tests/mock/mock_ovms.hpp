@@ -224,6 +224,8 @@ struct StandardMetricsType {
     OvmsMetricBool*   ms_v_env_awake            = new OvmsMetricBool("ms_v_env_awake");
     OvmsMetricBool*   ms_v_env_locked           = new OvmsMetricBool("ms_v_env_locked");
     OvmsMetricBool*   ms_v_env_hvac             = new OvmsMetricBool("ms_v_env_hvac");
+    OvmsMetricBool*   ms_v_env_heating          = new OvmsMetricBool("ms_v_env_heating");
+    OvmsMetricBool*   ms_v_env_cooling          = new OvmsMetricBool("ms_v_env_cooling");
     OvmsMetricBool*   ms_v_env_charging12v      = new OvmsMetricBool("ms_v_env_charging12v");
     OvmsMetricInt*    ms_v_env_parktime         = new OvmsMetricInt("ms_v_env_parktime");
     // Doors
@@ -258,6 +260,7 @@ extern StandardMetricsType StandardMetrics;
 // Metric registry (subset) — InitInt creates a standalone custom metric.
 // ---------------------------------------------------------------------------
 static constexpr int SM_STALE_MIN = 60;
+static constexpr int SM_STALE_MID = 120;
 struct OvmsMetrics {
     OvmsMetricInt* InitInt(const char* name, int /*autostale*/ = 0, int value = 0) {
         // Real OVMS metrics are singletons by name owned by the framework for the process
@@ -275,6 +278,14 @@ struct OvmsMetrics {
         auto& slot = registry[name];
         if (!slot) slot.reset(new OvmsMetricBool(name));
         slot->SetValue(value);
+        return slot.get();
+    }
+    // InitString mirrors the others for string custom metrics (e.g. xvg.v.env.climate.state).
+    OvmsMetricString* InitString(const char* name, int /*autostale*/ = 0, const char* value = nullptr) {
+        static std::map<std::string, std::unique_ptr<OvmsMetricString>> registry;
+        auto& slot = registry[name];
+        if (!slot) slot.reset(new OvmsMetricString(name));
+        if (value) slot->SetValue(value);
         return slot.get();
     }
 };

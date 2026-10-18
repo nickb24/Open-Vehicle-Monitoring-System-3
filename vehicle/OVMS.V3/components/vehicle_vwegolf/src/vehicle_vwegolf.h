@@ -137,9 +137,8 @@ class OvmsVehicleVWeGolf : public OvmsVehicle {
     // D1 = 1, D2 = 2, D3 = 3, B = 4. -1 = N/A (not in gear D or B).
     OvmsMetricInt* m_recup_level = nullptr;
 
-    // Heated front windshield
-    OvmsMetricBool* m_env_heated_front_window = nullptr;
-    // TEST BRANCH: last logged 0x594 window heating bits (front | rear << 1); 0xFF = none logged yet.
+    // TEST BRANCH: last logged 0x594 window heating request bits (front | rear << 1); 0xFF = none yet.
+    // (xvg.v.env.heated_front_window itself is owned by the BatteryControl status decoder.)
     uint8_t m_win_heat_last = 0xFF;
 
     // `xvg charge profile list` handler: fetch the car's charge profiles (charge locations) via the

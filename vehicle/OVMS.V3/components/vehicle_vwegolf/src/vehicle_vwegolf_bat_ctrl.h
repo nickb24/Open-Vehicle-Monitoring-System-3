@@ -27,6 +27,7 @@
 #define __VEHICLE_VWEGOLF_BAT_CTRL_H__
 
 #include "can.h"
+#include "ovms_metrics.h"
 #include "egolf/battery_control.h"  // BatteryControl (LSG 0x25) BAP command + status codec
 
 // Climate uses a dedicated, non-colliding CAN-NM wake from a SPARE (unused) node id
@@ -81,6 +82,10 @@ class VWeGolfBatteryControl {
  public:
     // bus = the KCAN / comfort bus (can3) the BCU lives on. Must outlive this object.
     void SetBus(canbus* bus) { m_bus = bus; }
+
+    // Register the metrics fed by the BCU's passive status broadcasts (PlugState 0x10, ChargeState
+    // 0x11, ClimateState 0x12). Call once from the vehicle constructor.
+    void InitStatusMetrics();
 
     // Entry points — each arms the wake bridge and kicks the first wake, then returns immediately
     // (true = request accepted); the sequence runs event-driven as the BCU responds. Only ONE command
@@ -243,8 +248,19 @@ class VWeGolfBatteryControl {
     // Timer STATUS/HEARTBEAT handler: drive the in-flight timer command off the (already-updated) cache
     // — write once the enable mask is known, confirm on the 49 53 echo, finish a list. RX task only.
     void HandleTimerStatus(const bap::Element& el);
-    // TEST BRANCH: log one line per change of the ClimateState (func 0x12) status/heartbeat. RX task only.
-    void LogClimateState(const bap::Element& el);
+    // ---- Passive BCU status: PlugState 0x10 / ChargeState 0x11 / ClimateState 0x12 ----------------
+    // Every status / heartbeat (and the copies inside a GetAll reply) updates the metrics; a change also
+    // logs one line, and an abort transition notifies. RX task only, except ClearStatus (Ticker1).
+    // `kind` = "status" / "hb" / "getall", for the log line.
+    void HandleStatusProperty(uint8_t func, const uint8_t* body, uint16_t len, const char* kind);
+    void HandleClimateState(const uint8_t* body, uint16_t len, const char* kind, bool changed);
+    void HandleChargeState(const uint8_t* body, uint16_t len, const char* kind, bool changed);
+    void HandlePlugState(const uint8_t* body, uint16_t len, const char* kind, bool changed);
+    // Bus asleep: the BCU is silent, so the status metrics read "no data" (and nothing is running).
+    void ClearStatus();
+    // Whether the BCU's ClimateState currently owns v.e.hvac (fresh, and describing a BCU climate
+    // session rather than "ignition on" / "init"); otherwise the clima ECU's 0x5EA bit decides.
+    bool BapClimateAuthoritative() const;
     // If BC_TIMER_LIST and the cache holds the mask + every slot, publish it (instant list). CP_PROFILE only.
     void TimerListMaybeComplete();
     // If BC_TIMER_SET/ENABLE and the enable mask is cached, RMW-write now (record + mask) and go to
@@ -303,9 +319,32 @@ class VWeGolfBatteryControl {
     bool     m_timer_enable     = false;            // desired enabled state of the target slot
     uint8_t  m_timer_target_mask = 0;               // the enable mask we wrote (confirm when it echoes)
 
-    // TEST BRANCH: last logged ClimateState body (LogClimateState logs only on change). RX task only.
-    uint8_t  m_cs_last[8]  = {};
-    uint8_t  m_cs_last_len = 0;   // 0 = nothing logged yet (reset at the start of each command)
+    // Passive status state. m_status_seen[] holds each property's last body (index 0 = PlugState,
+    // 1 = ChargeState, 2 = ClimateState) for change detection; len 0 = log the next one regardless
+    // (reset at the start of each command and on sleep). The *_state members are the last decoded
+    // values (0xFF = none since wake), used for the abort-transition notifications and v.e.hvac.
+    static constexpr uint8_t kClimateFreshSecs = 30;  // ClimateState heartbeat is ~13 s
+    struct StatusSeen { uint8_t raw[12]; uint8_t len; };
+    StatusSeen m_status_seen[3]   = {};
+    uint8_t  m_cs_state           = 0xFF;  // last climateState
+    uint8_t  m_cs_age             = 0xFF;  // seconds since the last ClimateState (saturates at 255)
+    uint8_t  m_chs_state          = 0xFF;  // last chargeState
+    uint8_t  m_plug_lock_state    = 0xFF;  // last plug lockState
+    bool     m_status_cleared     = false; // ClearStatus() done for the current sleep
+
+    OvmsMetricString* m_ms_climate_state       = nullptr;  // xvg.v.env.climate.state
+    OvmsMetricString* m_ms_climate_heaterstate = nullptr;  // xvg.v.env.climate.heaterstate
+    OvmsMetricString* m_ms_climate_mode        = nullptr;  // xvg.v.env.climate.mode
+    OvmsMetricString* m_ms_climate_heaters     = nullptr;  // xvg.v.env.climate.heaters
+    OvmsMetricString* m_ms_climate_raw         = nullptr;  // xvg.v.env.climate.raw
+    OvmsMetricBool*   m_ms_front_window        = nullptr;  // xvg.v.env.heated_front_window
+    OvmsMetricString* m_ms_charge_mode         = nullptr;  // xvg.v.c.bcu.mode
+    OvmsMetricString* m_ms_charge_state        = nullptr;  // xvg.v.c.bcu.state
+    OvmsMetricString* m_ms_charge_raw          = nullptr;  // xvg.v.c.bcu.raw
+    OvmsMetricString* m_ms_plug_state          = nullptr;  // xvg.v.c.plug.state
+    OvmsMetricString* m_ms_plug_supply         = nullptr;  // xvg.v.c.plug.supply
+    OvmsMetricString* m_ms_plug_lock           = nullptr;  // xvg.v.c.plug.lock
+    OvmsMetricString* m_ms_plug_lockerror      = nullptr;  // xvg.v.c.plug.lockerror
 
     ClimatePhase m_phase       = CP_IDLE;
     BcOp    m_op            = BC_CLIMATE;  // which operation the in-flight command performs

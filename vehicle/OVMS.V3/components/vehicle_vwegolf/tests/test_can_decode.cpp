@@ -383,29 +383,29 @@ void test_charge_state_no_spurious_stop() {
 }
 
 // ---------------------------------------------------------------------------
-// TEST BRANCH: 0x594 d[7] window heating bits — front bit 7 (metric) and rear bit 5 (log only)
+// TEST BRANCH: 0x594 d[7] window heating REQUEST bits — front bit 7, rear bit 5 (log only)
 // ---------------------------------------------------------------------------
 void test_window_heat_0x594() {
     printf("\ntest_window_heat_0x594\n");
     auto* v = make_vehicle();
     const char* fw = "xvg.v.env.heated_front_window";
     // Idle 0x594 with d[7] = setpoint 0x0D (22.0 C) | front 0x80 | rear 0x20. Each change is logged
-    // once ("0x594 window heating: ..."); the repeated frame is not.
+    // once ("0x594 window heating: ..."); the repeated frame is not. The bits are only the BCU's
+    // request (it drops the windscreen request when the car declines), so they no longer drive the
+    // heater metric — that comes from ClimateState 0x12 (see test_bat_ctrl).
     auto frame = [](uint8_t d7) {
         return make_frame(0x594, {0x00, 0x00, 0x20, 0x03, 0x00, 0x00, 0x10, d7});
     };
     auto off = frame(0x0D), front = frame(0x8D), both = frame(0xAD), rear = frame(0x2D);
     v->IncomingFrameCan3(&off);
-    CHECK(g_metrics.numbers[fw] == 0, "d[7] 0x0D: front window off");
     v->IncomingFrameCan3(&front);
     v->IncomingFrameCan3(&front);
-    CHECK(g_metrics.numbers[fw] == 1, "d[7] 0x8D: front window on");
+    CHECK(g_metrics.numbers[fw] == 0, "d[7] 0x8D: front request bit does NOT set heated_front_window");
     v->IncomingFrameCan3(&both);
-    CHECK(g_metrics.numbers[fw] == 1, "d[7] 0xAD: front window still on with the rear bit set");
     CHECK(near(StandardMetrics.ms_v_env_cabinsetpoint->AsFloat(), 22.0f),
           "cabin setpoint (d[7] bits 0-4) unaffected by the heater bits");
     v->IncomingFrameCan3(&rear);
-    CHECK(g_metrics.numbers[fw] == 0, "d[7] 0x2D: front window off, rear bit alone");
+    CHECK(g_metrics.numbers[fw] == 0, "d[7] 0x2D: heated_front_window still off");
     delete v;
 }
 

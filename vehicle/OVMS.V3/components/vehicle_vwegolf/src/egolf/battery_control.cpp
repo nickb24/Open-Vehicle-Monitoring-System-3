@@ -25,6 +25,8 @@
 
 #include "egolf/battery_control.h"
 
+#include <cstdio>  // snprintf — status value names
+
 namespace bap {
 namespace egolf {
 
@@ -128,6 +130,209 @@ size_t decodeProfileArray(const uint8_t* body, uint16_t bodyLen,
   }
   if (result) *result = res;
   return count;
+}
+
+// ---------------------------------------------------------------------------
+// Status property names (PlugState / ChargeState / ClimateState)
+// ---------------------------------------------------------------------------
+
+namespace {
+// One enum value or bit: its name, and whether it has been seen on the wire in the matching car state.
+struct ValueName {
+  uint8_t value;
+  const char* name;
+  bool confirmed;
+};
+
+// snprintf into out + len, keeping len <= cap - 1 when the output is truncated.
+size_t appendf(char* out, size_t cap, size_t len, const char* fmt, const char* a, const char* b) {
+  if (len + 1 >= cap) return len;
+  int n = snprintf(out + len, cap - len, fmt, a, b);
+  if (n < 0) return len;
+  len += (size_t)n;
+  return len < cap ? len : cap - 1;
+}
+
+size_t nameOf(const ValueName* table, size_t n, uint8_t v, char* out, size_t cap) {
+  if (cap == 0) return 0;
+  for (size_t i = 0; i < n; i++) {
+    if (table[i].value == v)
+      return appendf(out, cap, 0, "%s%s", table[i].name, table[i].confirmed ? "" : " (unconfirmed)");
+  }
+  int len = snprintf(out, cap, "unknown (%u)", (unsigned)v);
+  return len < 0 ? 0 : ((size_t)len < cap ? (size_t)len : cap - 1);
+}
+
+size_t bitNames(const ValueName* table, size_t n, uint8_t bits, char* out, size_t cap) {
+  if (cap == 0) return 0;
+  out[0] = '\0';
+  if (bits == 0) return appendf(out, cap, 0, "%s%s", "none", "");
+  size_t len = 0;
+  uint8_t known = 0;
+  for (size_t i = 0; i < n; i++) {
+    known |= table[i].value;
+    if (!(bits & table[i].value)) continue;
+    if (len) len = appendf(out, cap, len, "%s%s", ",", "");
+    len = appendf(out, cap, len, "%s%s", table[i].name, table[i].confirmed ? "" : " (unconfirmed)");
+  }
+  if (bits & ~known) {
+    char hex[8];
+    snprintf(hex, sizeof(hex), "0x%02x", (unsigned)(bits & ~known));
+    if (len) len = appendf(out, cap, len, "%s%s", ",", "");
+    len = appendf(out, cap, len, "unknown bits %s%s", hex, "");
+  }
+  return len;
+}
+
+#define VWE_N(t) (sizeof(t) / sizeof((t)[0]))
+
+const ValueName kClimateStates[] = {
+  {CS_INIT, "init", false},
+  {CS_ABORT_BODY_OPEN, "aborted: car body open", false},
+  {CS_ABORT_IGNITION_ON, "aborted: ignition on", true},
+  {CS_ABORT_NO_FUEL, "aborted: park heater fuel low", false},
+  {CS_ABORT_HEATER_MAX_TIME, "aborted: park heater max time", false},
+  {CS_ABORT_NO_EXT_SUPPLY, "aborted: no external supply", false},
+  {CS_ABORT_DEVICE_ERROR, "aborted: device error", false},
+  {CS_ABORT_BATTERY_CONDITION, "aborted: battery condition", false},
+  {CS_ABORT_BATTERY_CHARGING, "aborted: battery charging", false},
+  {CS_ABORT_BATTERY_LOW, "aborted: battery low", false},
+  {CS_IDLE, "idle", true},
+  {CS_RUNNING, "running", true},
+  {CS_ABORT_NOT_IN_PARK, "aborted: not in park", false},
+  {CS_ABORT_POWER_REDUCTION, "aborted: power reduction", false},
+  {CS_COMPLETED, "completed", false},
+};
+// seatheaterWindowState uses a subset of the climateState numbers.
+const ValueName kHeaterStates[] = {
+  {CS_INIT, "init", false},
+  {CS_ABORT_IGNITION_ON, "aborted: ignition on", false},
+  {CS_ABORT_DEVICE_ERROR, "aborted: device error", false},
+  {CS_ABORT_BATTERY_CONDITION, "aborted: battery condition", false},
+  {CS_ABORT_BATTERY_LOW, "aborted: battery low", false},
+  {CS_IDLE, "idle", true},
+  {CS_RUNNING, "running", true},
+  {CS_COMPLETED, "completed", false},
+};
+const ValueName kClimateModes[] = {
+  {CM_CLIMATING, "climating", true},
+  {CM_DEFROST, "defrost", false},
+  {CM_HEATING, "heating", true},
+  {CM_COOLING, "cooling", false},
+  {CM_VENTILATION, "ventilation", true},
+  {CM_FUEL_HEATING, "fuel heating", false},
+};
+const ValueName kClimateHeaters[] = {
+  {CH_SEAT_FL, "seat front left", false},
+  {CH_SEAT_FR, "seat front right", false},
+  {CH_SEAT_RL, "seat rear left", false},
+  {CH_SEAT_RR, "seat rear right", false},
+  {CH_WINDOW_FRONT, "front window", true},
+  {CH_WINDOW_REAR, "rear window", false},
+};
+const ValueName kChargeModes[] = {
+  {CHM_OFF, "off", true},
+  {CHM_AC, "AC", false},
+  {CHM_DC, "DC", false},
+  {CHM_CONDITIONING, "conditioning", true},
+  {CHM_AC_CONDITIONING, "AC + conditioning", false},
+  {CHM_DC_CONDITIONING, "DC + conditioning", false},
+  {CHM_INIT, "init", false},
+};
+const ValueName kChargeStates[] = {
+  {CHS_INIT, "init", false},
+  {CHS_IDLE, "idle", true},
+  {CHS_RUNNING, "running", false},
+  {CHS_CONSERVATION, "conservation", false},
+  {CHS_ABORT_TEMP_LOW, "aborted: temperature too low", false},
+  {CHS_ABORT_DEVICE_ERROR, "aborted: device error", false},
+  {CHS_ABORT_NO_SUPPLY, "aborted: power supply not available", false},
+  {CHS_ABORT_NOT_IN_PARK, "aborted: not in park", false},
+  {CHS_COMPLETED, "completed", false},
+};
+const ValueName kPlugLockSetups[] = {
+  {0, "unlocked", true},
+  {1, "locked", false},
+  {15, "init", false},
+};
+const ValueName kPlugLockStates[] = {
+  {2, "auto-lock error", false},
+  {3, "unlock error", false},
+  {15, "no error", true},
+};
+const ValueName kPlugSupplies[] = {
+  {0, "inactive", true},
+  {1, "active", false},
+  {2, "charging station connected", false},
+  {15, "init", false},
+};
+const ValueName kPlugStates[] = {
+  {0, "unplugged", true},
+  {1, "plugged", false},
+  {15, "init", false},
+};
+}  // namespace
+
+size_t climateStateName(uint8_t v, char* out, size_t cap) {
+  return nameOf(kClimateStates, VWE_N(kClimateStates), v, out, cap);
+}
+size_t heaterStateName(uint8_t v, char* out, size_t cap) {
+  return nameOf(kHeaterStates, VWE_N(kHeaterStates), v, out, cap);
+}
+size_t climateModeNames(uint8_t bits, char* out, size_t cap) {
+  return bitNames(kClimateModes, VWE_N(kClimateModes), bits, out, cap);
+}
+size_t climateHeaterNames(uint8_t bits, char* out, size_t cap) {
+  return bitNames(kClimateHeaters, VWE_N(kClimateHeaters), bits, out, cap);
+}
+size_t chargeModeName(uint8_t v, char* out, size_t cap) {
+  return nameOf(kChargeModes, VWE_N(kChargeModes), v, out, cap);
+}
+size_t chargeStateName(uint8_t v, char* out, size_t cap) {
+  return nameOf(kChargeStates, VWE_N(kChargeStates), v, out, cap);
+}
+size_t plugLockSetupName(uint8_t v, char* out, size_t cap) {
+  return nameOf(kPlugLockSetups, VWE_N(kPlugLockSetups), v, out, cap);
+}
+size_t plugLockStateName(uint8_t v, char* out, size_t cap) {
+  return nameOf(kPlugLockStates, VWE_N(kPlugLockStates), v, out, cap);
+}
+size_t plugSupplyName(uint8_t v, char* out, size_t cap) {
+  return nameOf(kPlugSupplies, VWE_N(kPlugSupplies), v, out, cap);
+}
+size_t plugStateName(uint8_t v, char* out, size_t cap) {
+  return nameOf(kPlugStates, VWE_N(kPlugStates), v, out, cap);
+}
+
+#undef VWE_N
+
+bool findGetAllValue(const uint8_t* body, uint16_t len, uint8_t func, const uint8_t** val,
+                     uint16_t* vlen) {
+  // This BCU's GetAll layout: properties in function order; fixedLen 0 = u16le length-prefixed.
+  static const struct { uint8_t func; uint8_t fixedLen; } kLayout[] = {
+    {0x02, 6}, {0x03, 0}, {0x04, 1}, {0x0D, 1}, {0x0E, 6}, {0x0F, 1}, {FUNC_PLUG_STATE, 2},
+    {FUNC_CHARGE_STATE, 0}, {FUNC_CLIMATE_STATE, 0}, {FUNC_TIMER_STATE, 2}, {FUNC_TIMER_1, 0},
+    {FUNC_TIMER_2, 0}, {FUNC_TIMER_3, 0},
+  };
+  if (body == nullptr) return false;
+  uint32_t pos = 0;
+  bool found = false;
+  for (const auto& e : kLayout) {
+    uint32_t n = e.fixedLen;
+    if (n == 0) {
+      if (pos + 2 > len) return false;
+      n = (uint32_t)body[pos] | ((uint32_t)body[pos + 1] << 8);
+      pos += 2;
+    }
+    if (pos + n > len) return false;
+    if (e.func == func) {
+      *val = body + pos;
+      *vlen = (uint16_t)n;
+      found = true;
+    }
+    pos += n;
+  }
+  return found && pos == len;  // the whole body must account for exactly this layout
 }
 
 }  // namespace egolf

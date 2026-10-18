@@ -44,9 +44,6 @@ OvmsVehicleVWeGolf::OvmsVehicleVWeGolf() {
     // gear-selector frame 0x187 in IncomingFrameCan3. -1 until first seen in D/B.
     m_recup_level = MyMetrics.InitInt("xvg.v.recup", SM_STALE_MIN, -1);
 
-    // Front windscreen heating active during remote pre-conditioning (0x594 byte 7 bit 7).
-    m_env_heated_front_window = MyMetrics.InitBool("xvg.v.env.heated_front_window", SM_STALE_MIN, false);
-
     // The J533 gateway rebroadcasts the powertrain/HV frames the module reads — gear (0x187),
     // VIN (0x6B4), SoC, pack current/voltage, speed — onto KCAN (CAN3) with the comfort/clima traffic,
     // so a single KCAN tap sees everything (confirmed in drive captures: gear and VIN both appear on
@@ -57,6 +54,9 @@ OvmsVehicleVWeGolf::OvmsVehicleVWeGolf() {
 
     // The climate controller drives the BCU over the KCAN (comfort) bus.
     m_batctrl.SetBus(m_can3);
+    // BCU status metrics (xvg.v.env.climate.*, xvg.v.env.heated_front_window, xvg.v.c.bcu.*,
+    // xvg.v.c.plug.*), fed passively from the BCU's PlugState / ChargeState / ClimateState broadcasts.
+    m_batctrl.InitStatusMetrics();
 
     OvmsCommand* cmd_vweg = MyCommandApp.RegisterCommand("xvg", "VW e-Golf controls");
     cmd_vweg->RegisterCommand("offline", "Stop sending OCU keepalive (diagnostic)", [this](...) {
@@ -596,13 +596,13 @@ void OvmsVehicleVWeGolf::IncomingFrameCan3(CAN_frame_t* p_frame) {
             //   //
             // }
 
-            // Front window heating active during remote pre-conditioning (bit 7). Follows the profile 0
-            // operation2 heater bit while climate runs; not set by the dashboard heater button.
+            // Front window heating request (bit 7): the BCU raises it at a remote climate start when
+            // profile 0 asks for the windscreen, and drops it again if the car declines (e.g. above the
+            // HVAC module's 4 °C rule) — so it is the request, not the heater state. The heater state
+            // (xvg.v.env.heated_front_window) comes from the BCU's ClimateState (0x12) instead.
             tmp_u8 = ((uint8_t)(d[7] & 0x80) >> 7);
-            m_env_heated_front_window->SetValue(tmp_u8 == 0x1);
 
-            // TEST BRANCH: log the window heating bits on change (front bit 7 as the known-working
-            // reference for the unconfirmed rear bit 5).
+            // TEST BRANCH: log the window heating request bits on change (front bit 7, rear bit 5).
             {
                 const uint8_t win = (uint8_t)(tmp_u8 | (rear_window_heat ? 0x02 : 0x00));
                 if (win != m_win_heat_last) {

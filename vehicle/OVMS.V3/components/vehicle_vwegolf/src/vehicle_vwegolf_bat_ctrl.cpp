@@ -26,7 +26,7 @@
 #include "vehicle_vwegolf_bat_ctrl.h"
 
 #include <cstdio>   // snprintf — compose the per-operation failure notification
-#include <cstring>  // memcmp / memcpy — ClimateState change log
+#include <cstring>  // memcmp / memcpy — status change detection
 
 #include "metrics_standard.h"
 #include "ovms_log.h"
@@ -213,11 +213,14 @@ bool VWeGolfBatteryControl::Begin(BcOp op, bool enable, uint16_t param) {
 // ---------------------------------------------------------------------------
 
 void VWeGolfBatteryControl::Ticker1(bool bus_alive) {
+    if (m_cs_age < 0xFF) m_cs_age++;  // ClimateState freshness (owns v.e.hvac while fresh)
+
     // The clima ECU (0x5EA) and the BCU (0x17332510) go silent once the bus sleeps and so
     // can't refresh HVAC; clear it as a backstop so climate doesn't read "on" forever after
-    // conditioning ends and the car sleeps.
+    // conditioning ends and the car sleeps. The BCU status metrics read "no data" (once per sleep).
     if (!bus_alive) {
         StandardMetrics.ms_v_env_hvac->SetValue(false);
+        if (!m_status_cleared) ClearStatus();
     }
 
     if (m_phase == CP_IDLE || m_wake_hold == 0) {
@@ -374,7 +377,7 @@ void VWeGolfBatteryControl::IncomingBapStatus(const CAN_frame_t* p_frame) {
     // still goes out), but the profile is never read and the command times out.
     if (!m_bcu_seen) {
         m_bap_asm.reset();
-        m_cs_last_len = 0;  // log the first ClimateState of each command, even if unchanged
+        for (auto& s : m_status_seen) s.len = 0;  // log each status once per command, even if unchanged
     }
     m_bcu_seen = true;
 
@@ -393,11 +396,24 @@ void VWeGolfBatteryControl::IncomingBapStatus(const CAN_frame_t* p_frame) {
         UpdateTimerCache(el);
     }
 
-    // TEST BRANCH: log every change of the ClimateState (func 0x12) status / heartbeat, in any phase
-    // and with no command in flight, so remote seat / window heating can be checked from the log.
-    if ((el.opcode == bap::OP_STATUS || el.opcode == bap::OP_HEARTBEAT) &&
-        el.func == bap::egolf::FUNC_CLIMATE_STATE) {
-        LogClimateState(el);
+    // Passive status decode (any phase, no TX): PlugState / ChargeState / ClimateState from their own
+    // status or heartbeat, and from the GetAll reply that answers every channel open, so the state is
+    // known right at wake instead of after the next ~13 s heartbeat.
+    if (el.opcode == bap::OP_STATUS || el.opcode == bap::OP_HEARTBEAT) {
+        const char* kind = el.opcode == bap::OP_HEARTBEAT ? "hb" : "status";
+        if (el.func == bap::egolf::FUNC_PLUG_STATE || el.func == bap::egolf::FUNC_CHARGE_STATE ||
+            el.func == bap::egolf::FUNC_CLIMATE_STATE) {
+            HandleStatusProperty(el.func, el.body, el.bodyLen, kind);
+        } else if (el.func == bap::egolf::FUNC_BAP_GETALL && el.opcode == bap::OP_STATUS) {
+            static const uint8_t kFuncs[] = {bap::egolf::FUNC_PLUG_STATE, bap::egolf::FUNC_CHARGE_STATE,
+                                             bap::egolf::FUNC_CLIMATE_STATE};
+            for (uint8_t f : kFuncs) {
+                const uint8_t* val = nullptr;
+                uint16_t vlen = 0;
+                if (bap::egolf::findGetAllValue(el.body, el.bodyLen, f, &val, &vlen))
+                    HandleStatusProperty(f, val, vlen, "getall");
+            }
+        }
     }
 
     // The OperationMode echo "49 58 <flag>" is the immediate-operation on/off state — reflect it on
@@ -664,55 +680,200 @@ void VWeGolfBatteryControl::IncomingBapStatus(const CAN_frame_t* p_frame) {
     }
 }
 
-// ClimateState (func 0x12) state names, DSI numbering (on-car: 2 / 11 / 12 seen on the wire). The
-// seatheaterWindowState enum uses the same numbers for the values it shares, so one table serves both
-// nibbles. 5 is not defined in the firmware.
-static const char* vwe_climate_state_name(uint8_t s) {
-    static const char* const names[16] = {
-        "init",                     "aborted: car body open",      "aborted: ignition on",
-        "aborted: park heater fuel", "aborted: park heater time",  "?",
-        "aborted: no ext supply",   "aborted: device error",       "aborted: battery condition",
-        "aborted: battery charging", "aborted: battery low",       "idle",
-        "running",                  "aborted: not in park",        "aborted: power reduction",
-        "completed",
-    };
-    return names[s & 0x0F];
+// ---------------------------------------------------------------------------
+// Passive BCU status: PlugState (0x10) / ChargeState (0x11) / ClimateState (0x12)
+// ---------------------------------------------------------------------------
+
+// "xx xx xx" hex dump of `len` bytes into out (stops early if cap runs out).
+static void vwe_hex(const uint8_t* b, uint16_t len, char* out, size_t cap) {
+    size_t l = 0;
+    if (cap) out[0] = '\0';
+    for (uint16_t i = 0; i < len && l + 4 <= cap; i++)
+        l += (size_t)snprintf(out + l, cap - l, i ? " %02x" : "%02x", b[i]);
 }
 
-void VWeGolfBatteryControl::LogClimateState(const bap::Element& el) {
-    // TEST BRANCH: one line per change of the BCU's 7-byte ClimateState. Decoded from the 2026-10-16
-    // captures: byte 0 = climateMode bits (0x01 climating, 0x02 auto defrost, 0x04 heating, 0x08
-    // cooling, 0x10 ventilation; 0x11 and 0x05 seen); byte 5 = climateState (high nibble) |
-    // seatheaterWindowState (low nibble). Byte 6 should carry the seat / window heater bits, but has
-    // never been seen non-zero, so it is printed raw. Bytes 1-4 have only ever read 00 00 0a 00.
-    if (el.body == nullptr || el.bodyLen == 0) return;
-    const uint8_t n = el.bodyLen < sizeof(m_cs_last) ? (uint8_t)el.bodyLen : (uint8_t)sizeof(m_cs_last);
-    if (n == m_cs_last_len && memcmp(el.body, m_cs_last, n) == 0) return;  // unchanged
-    memcpy(m_cs_last, el.body, n);
-    m_cs_last_len = n;
+void VWeGolfBatteryControl::InitStatusMetrics() {
+    // The BCU sends each property about every 13 s while awake, so SM_STALE_MID (not MIN) keeps them
+    // fresh between heartbeats. ClearStatus() sets "no data" while the bus sleeps.
+    m_ms_climate_state       = MyMetrics.InitString("xvg.v.env.climate.state", SM_STALE_MID, "no data");
+    m_ms_climate_heaterstate = MyMetrics.InitString("xvg.v.env.climate.heaterstate", SM_STALE_MID, "no data");
+    m_ms_climate_mode        = MyMetrics.InitString("xvg.v.env.climate.mode", SM_STALE_MID, "none");
+    m_ms_climate_heaters     = MyMetrics.InitString("xvg.v.env.climate.heaters", SM_STALE_MID, "none");
+    m_ms_climate_raw         = MyMetrics.InitString("xvg.v.env.climate.raw", SM_STALE_MID, "");
+    // Windscreen heating actually running in a remote climate session (ClimateState heater bit 0x10).
+    m_ms_front_window        = MyMetrics.InitBool("xvg.v.env.heated_front_window", SM_STALE_MID, false);
+    m_ms_charge_mode         = MyMetrics.InitString("xvg.v.c.bcu.mode", SM_STALE_MID, "no data");
+    m_ms_charge_state        = MyMetrics.InitString("xvg.v.c.bcu.state", SM_STALE_MID, "no data");
+    m_ms_charge_raw          = MyMetrics.InitString("xvg.v.c.bcu.raw", SM_STALE_MID, "");
+    m_ms_plug_state          = MyMetrics.InitString("xvg.v.c.plug.state", SM_STALE_MID, "no data");
+    m_ms_plug_supply         = MyMetrics.InitString("xvg.v.c.plug.supply", SM_STALE_MID, "no data");
+    m_ms_plug_lock           = MyMetrics.InitString("xvg.v.c.plug.lock", SM_STALE_MID, "no data");
+    m_ms_plug_lockerror      = MyMetrics.InitString("xvg.v.c.plug.lockerror", SM_STALE_MID, "no data");
+}
 
-    char hex[3 * sizeof(m_cs_last) + 1] = "";
-    size_t hl = 0;
-    for (uint8_t i = 0; i < n; i++)
-        hl += snprintf(hex + hl, sizeof(hex) - hl, i ? " %02x" : "%02x", el.body[i]);
-    const char* kind = el.opcode == bap::OP_HEARTBEAT ? "hb" : "status";
-    if (el.bodyLen < 7) {
-        ESP_LOGI(TAG, "ClimateState 0x12 (%s): %s (short: %u bytes)", kind, hex, (unsigned)el.bodyLen);
+void VWeGolfBatteryControl::HandleStatusProperty(uint8_t func, const uint8_t* body, uint16_t len,
+                                                 const char* kind) {
+    if (body == nullptr || len == 0 || m_ms_climate_state == nullptr) return;
+    const uint8_t idx = (uint8_t)(func - bap::egolf::FUNC_PLUG_STATE);  // 0x10 / 0x11 / 0x12 -> 0 / 1 / 2
+    if (idx > 2) return;
+    m_status_cleared = false;
+
+    StatusSeen& seen = m_status_seen[idx];
+    const uint8_t n = len < sizeof(seen.raw) ? (uint8_t)len : (uint8_t)sizeof(seen.raw);
+    const bool changed = seen.len == 0 || n != seen.len || memcmp(seen.raw, body, n) != 0;
+    memcpy(seen.raw, body, n);
+    seen.len = n;
+
+    if (func == bap::egolf::FUNC_PLUG_STATE)        HandlePlugState(body, len, kind, changed);
+    else if (func == bap::egolf::FUNC_CHARGE_STATE) HandleChargeState(body, len, kind, changed);
+    else                                            HandleClimateState(body, len, kind, changed);
+}
+
+void VWeGolfBatteryControl::HandleClimateState(const uint8_t* body, uint16_t len, const char* kind,
+                                               bool changed) {
+    using namespace bap::egolf;
+    char hex[40];
+    vwe_hex(body, len, hex, sizeof(hex));
+    ClimateState cs;
+    if (!decodeClimateState(body, len, cs)) {
+        if (changed) ESP_LOGW(TAG, "ClimateState 0x12 (%s): %s (short: %u bytes, ignored)", kind, hex, (unsigned)len);
         return;
     }
+    char state[48], hstate[48], mode[128], heaters[160];
+    climateStateName(cs.state, state, sizeof(state));
+    heaterStateName(cs.heaterState, hstate, sizeof(hstate));
+    climateModeNames(cs.mode, mode, sizeof(mode));
+    climateHeaterNames(cs.heaters, heaters, sizeof(heaters));
 
-    const uint8_t m = el.body[0];
-    char mode[48];
-    int ml = snprintf(mode, sizeof(mode), "%s%s%s%s%s",
-                      (m & 0x01) ? "climating " : "", (m & 0x02) ? "defrost " : "",
-                      (m & 0x04) ? "heating " : "",   (m & 0x08) ? "cooling " : "",
-                      (m & 0x10) ? "ventilation " : "");
-    if (ml > 0) mode[ml - 1] = '\0';
-    else snprintf(mode, sizeof(mode), "-");
+    const uint8_t prev = m_cs_state;
+    m_cs_state = cs.state;
+    m_cs_age = 0;
 
-    const uint8_t cs = el.body[5] >> 4, sw = el.body[5] & 0x0F;
-    ESP_LOGI(TAG, "ClimateState 0x12 (%s): %s | climate %u %s | seat/window %u %s | mode 0x%02x %s | heaters 0x%02x",
-             kind, hex, cs, vwe_climate_state_name(cs), sw, vwe_climate_state_name(sw), m, mode, el.body[6]);
+    m_ms_climate_state->SetValue(state);
+    m_ms_climate_heaterstate->SetValue(hstate);
+    m_ms_climate_mode->SetValue(mode);
+    m_ms_climate_heaters->SetValue(heaters);
+    m_ms_climate_raw->SetValue(hex);
+    m_ms_front_window->SetValue((cs.heaters & CH_WINDOW_FRONT) != 0);
+    StandardMetrics.ms_v_env_heating->SetValue((cs.mode & CM_HEATING) != 0);
+    StandardMetrics.ms_v_env_cooling->SetValue((cs.mode & CM_COOLING) != 0);
+    if (BapClimateAuthoritative())
+        StandardMetrics.ms_v_env_hvac->SetValue(cs.state == CS_RUNNING);
+
+    if (changed)
+        ESP_LOGI(TAG, "ClimateState 0x12 (%s): %s | climate: %s | seat/window: %s | mode: %s | heaters: %s",
+                 kind, hex, state, hstate, mode, heaters);
+
+    // Say why climate stopped or never started: the reasons the head unit shows popups for, and the
+    // rest of the abort values. "ignition on" and "car body open" are the normal end of a remote session
+    // (the driver got in), so they are only logged. Notify only on an observed transition, so a stale
+    // abort state at wake or a heartbeat repeat stays quiet.
+    if (prev != 0xFF && prev != cs.state && climateStateIsAbort(cs.state) && !climateStateIsAbort(prev) &&
+        cs.state != CS_ABORT_IGNITION_ON && cs.state != CS_ABORT_BODY_OPEN) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "Climate %s: %s", prev == CS_RUNNING ? "stopped" : "not started", state);
+        ESP_LOGW(TAG, "%s", msg);
+        MyNotify.NotifyString("alert", "xvg.climate", msg);
+    }
+}
+
+void VWeGolfBatteryControl::HandleChargeState(const uint8_t* body, uint16_t len, const char* kind,
+                                              bool changed) {
+    using namespace bap::egolf;
+    char hex[40];
+    vwe_hex(body, len, hex, sizeof(hex));
+    ChargeState chs;
+    if (!decodeChargeState(body, len, chs)) {
+        if (changed) ESP_LOGW(TAG, "ChargeState 0x11 (%s): %s (short: %u bytes, ignored)", kind, hex, (unsigned)len);
+        return;
+    }
+    char mode[48], state[56];
+    chargeModeName(chs.mode, mode, sizeof(mode));
+    chargeStateName(chs.state, state, sizeof(state));
+
+    const uint8_t prev = m_chs_state;
+    m_chs_state = chs.state;
+
+    // Charging itself stays on 0x594 (ms_v_charge_*) and SOC on 0x131; this only adds the BCU's view.
+    m_ms_charge_mode->SetValue(mode);
+    m_ms_charge_state->SetValue(state);
+    m_ms_charge_raw->SetValue(hex);
+
+    if (changed) {
+        char soc[16];
+        if (chs.soc <= 100) snprintf(soc, sizeof(soc), "%u%%", (unsigned)chs.soc);
+        else snprintf(soc, sizeof(soc), "unknown");
+        ESP_LOGI(TAG, "ChargeState 0x11 (%s): %s | mode: %s | state: %s | soc: %s", kind, hex, mode, state, soc);
+    }
+
+    if (prev != 0xFF && prev != chs.state && chargeStateIsAbort(chs.state) && !chargeStateIsAbort(prev)) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "Charging %s: %s", prev == CHS_RUNNING ? "stopped" : "not started", state);
+        ESP_LOGW(TAG, "%s", msg);
+        MyNotify.NotifyString("alert", "xvg.charge", msg);
+    }
+}
+
+void VWeGolfBatteryControl::HandlePlugState(const uint8_t* body, uint16_t len, const char* kind,
+                                            bool changed) {
+    using namespace bap::egolf;
+    char hex[40];
+    vwe_hex(body, len, hex, sizeof(hex));
+    PlugState ps;
+    if (!decodePlugState(body, len, ps)) {
+        if (changed) ESP_LOGW(TAG, "PlugState 0x10 (%s): %s (short: %u bytes, ignored)", kind, hex, (unsigned)len);
+        return;
+    }
+    char plug[40], supply[48], lock[40], lockerr[40];
+    plugStateName(ps.plugState, plug, sizeof(plug));
+    plugSupplyName(ps.supplyState, supply, sizeof(supply));
+    plugLockSetupName(ps.lockSetup, lock, sizeof(lock));
+    plugLockStateName(ps.lockState, lockerr, sizeof(lockerr));
+
+    const uint8_t prev = m_plug_lock_state;
+    m_plug_lock_state = ps.lockState;
+
+    m_ms_plug_state->SetValue(plug);
+    m_ms_plug_supply->SetValue(supply);
+    m_ms_plug_lock->SetValue(lock);
+    m_ms_plug_lockerror->SetValue(lockerr);
+
+    if (changed)
+        ESP_LOGI(TAG, "PlugState 0x10 (%s): %s | plug: %s | supply: %s | lock: %s | lock error: %s",
+                 kind, hex, plug, supply, lock, lockerr);
+
+    if (prev != 0xFF && prev != ps.lockState && plugLockIsError(ps.lockState)) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "Charge port lock: %s", lockerr);
+        ESP_LOGW(TAG, "%s", msg);
+        MyNotify.NotifyString("alert", "xvg.charge", msg);
+    }
+}
+
+void VWeGolfBatteryControl::ClearStatus() {
+    m_status_cleared = true;
+    for (auto& s : m_status_seen) s.len = 0;
+    m_cs_state = m_chs_state = m_plug_lock_state = 0xFF;  // no notification for the first state at wake
+    m_cs_age = 0xFF;
+    if (m_ms_climate_state == nullptr) return;
+    m_ms_climate_state->SetValue("no data");
+    m_ms_climate_heaterstate->SetValue("no data");
+    m_ms_climate_mode->SetValue("none");
+    m_ms_climate_heaters->SetValue("none");
+    m_ms_front_window->SetValue(false);
+    StandardMetrics.ms_v_env_heating->SetValue(false);
+    StandardMetrics.ms_v_env_cooling->SetValue(false);
+    m_ms_charge_mode->SetValue("no data");
+    m_ms_charge_state->SetValue("no data");
+    m_ms_plug_state->SetValue("no data");
+    m_ms_plug_supply->SetValue("no data");
+    m_ms_plug_lock->SetValue("no data");
+    m_ms_plug_lockerror->SetValue("no data");
+}
+
+bool VWeGolfBatteryControl::BapClimateAuthoritative() const {
+    return m_cs_state != 0xFF && m_cs_age <= kClimateFreshSecs &&
+           m_cs_state != bap::egolf::CS_ABORT_IGNITION_ON && m_cs_state != bap::egolf::CS_INIT;
 }
 
 void VWeGolfBatteryControl::UpdateTimerCache(const bap::Element& el) {
@@ -796,6 +957,10 @@ void VWeGolfBatteryControl::IncomingClimaEcuStatus(const CAN_frame_t* p_frame) {
     // armed (d3=0x80) or actually running (d3=0x88), so keying HVAC on those bits leaves it stuck
     // true after a stop (the BCU drops 0x88 -> 0x80 when conditioning ends). The conditioning bit
     // (0x08) clears on stop, so use it.
+    // While the BCU's ClimateState is fresh and describes a BCU climate session it owns v.e.hvac
+    // (running -> on, idle / completed / aborted -> off, see HandleClimateState); this bit decides when
+    // the car is in use ("ignition on") or no ClimateState has been heard.
+    if (BapClimateAuthoritative()) return;
     const uint8_t* d = p_frame->data.u8;
     StandardMetrics.ms_v_env_hvac->SetValue((d[3] & 0x08) != 0);
 }
