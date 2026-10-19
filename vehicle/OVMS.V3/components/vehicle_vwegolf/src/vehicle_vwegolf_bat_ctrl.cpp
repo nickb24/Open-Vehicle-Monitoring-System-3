@@ -706,6 +706,8 @@ void VWeGolfBatteryControl::InitStatusMetrics() {
     m_ms_charge_mode         = MyMetrics.InitString("xvg.v.c.bcu.mode", SM_STALE_MID, "no data");
     m_ms_charge_state        = MyMetrics.InitString("xvg.v.c.bcu.state", SM_STALE_MID, "no data");
     m_ms_charge_raw          = MyMetrics.InitString("xvg.v.c.bcu.raw", SM_STALE_MID, "");
+    // Remaining charge time by the minute (v.c.duration.full from 0x594 has 5-minute steps). -1 = none.
+    m_ms_charge_remaining    = MyMetrics.InitInt("xvg.v.c.bcu.remaining", SM_STALE_MID, -1, Minutes);
     m_ms_plug_state          = MyMetrics.InitString("xvg.v.c.plug.state", SM_STALE_MID, "no data");
     m_ms_plug_supply         = MyMetrics.InitString("xvg.v.c.plug.supply", SM_STALE_MID, "no data");
     m_ms_plug_lock           = MyMetrics.InitString("xvg.v.c.plug.lock", SM_STALE_MID, "no data");
@@ -799,12 +801,16 @@ void VWeGolfBatteryControl::HandleChargeState(const uint8_t* body, uint16_t len,
     m_ms_charge_mode->SetValue(mode);
     m_ms_charge_state->SetValue(state);
     m_ms_charge_raw->SetValue(hex);
+    m_ms_charge_remaining->SetValue(chs.remainingMin == 0xFFFF ? -1 : (int)chs.remainingMin);
 
     if (changed) {
-        char soc[16];
+        char soc[16], remaining[16];
         if (chs.soc <= 100) snprintf(soc, sizeof(soc), "%u%%", (unsigned)chs.soc);
         else snprintf(soc, sizeof(soc), "unknown");
-        ESP_LOGI(TAG, "ChargeState 0x11 (%s): %s | mode: %s | state: %s | soc: %s", kind, hex, mode, state, soc);
+        if (chs.remainingMin != 0xFFFF) snprintf(remaining, sizeof(remaining), "%u min", (unsigned)chs.remainingMin);
+        else snprintf(remaining, sizeof(remaining), "-");
+        ESP_LOGI(TAG, "ChargeState 0x11 (%s): %s | mode: %s | state: %s | soc: %s | remaining: %s",
+                 kind, hex, mode, state, soc, remaining);
     }
 
     if (prev != 0xFF && prev != chs.state && chargeStateIsAbort(chs.state) && !chargeStateIsAbort(prev)) {

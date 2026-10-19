@@ -232,7 +232,7 @@ const ValueName kClimateHeaters[] = {
 };
 const ValueName kChargeModes[] = {
   {CHM_OFF, "off", true},
-  {CHM_AC, "AC", false},
+  {CHM_AC, "AC", true},    // [WIRE 2026-10-18: AC charging]
   {CHM_DC, "DC", false},
   {CHM_CONDITIONING, "conditioning", true},
   {CHM_AC_CONDITIONING, "AC + conditioning", false},
@@ -252,7 +252,7 @@ const ValueName kChargeStates[] = {
 };
 const ValueName kPlugLockSetups[] = {
   {0, "unlocked", true},
-  {1, "locked", false},
+  {1, "locked", true},     // [WIRE 2026-10-18: cable locked while charging]
   {15, "init", false},
 };
 const ValueName kPlugLockStates[] = {

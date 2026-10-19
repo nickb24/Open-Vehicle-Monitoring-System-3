@@ -1272,7 +1272,14 @@ void test_status_decoders_and_names() {
     ChargeState chs;
     const uint8_t cb[] = {0x31, 0x3e};
     CHECK(decodeChargeState(cb, 2, chs) && chs.mode == CHM_CONDITIONING && chs.state == CHS_IDLE &&
-          chs.soc == 62, "ChargeState 31 3e = conditioning / idle / 62 %");
+          chs.soc == 62 && chs.remainingMin == 0xFFFF, "ChargeState 31 3e = conditioning / idle / 62 %");
+    const uint8_t charging[] = {0x12, 0x4a, 0xaf, 0x00, 0xff, 0xff, 0x00, 0xff, 0x11};  // on-car, AC
+    CHECK(decodeChargeState(charging, sizeof(charging), chs) && chs.mode == CHM_AC &&
+          chs.state == CHS_RUNNING && chs.soc == 74 && chs.remainingMin == 175,
+          "AC charging: AC / running / 74 % / 175 min remaining");
+    const uint8_t idleFull[] = {0x01, 0x52, 0xff, 0xff, 0xff, 0xff, 0x00, 0xff, 0x01};
+    CHECK(decodeChargeState(idleFull, sizeof(idleFull), chs) && chs.remainingMin == 0xFFFF,
+          "not charging: remaining time ff ff = none");
     chargeModeName(CHM_CONDITIONING, s, sizeof(s));
     CHECK(strcmp(s, "conditioning") == 0, "charge mode 3 = conditioning");
     chargeStateName(CHS_ABORT_NO_SUPPLY, s, sizeof(s));
@@ -1397,8 +1404,9 @@ void test_status_abort_notifications() {
 
     // ChargeState: running (AC) -> power supply not available.
     inject_bap_status(v, bap::egolf::FUNC_CHARGE_STATE, {0x12, 0x3e, 0xff, 0xff, 0xff, 0xff, 0x00, 0xff, 0x01});
-    CHECK(str_metric("xvg.v.c.bcu.mode") == "AC (unconfirmed)" &&
+    CHECK(str_metric("xvg.v.c.bcu.mode") == "AC" &&
           str_metric("xvg.v.c.bcu.state") == "running", "charge mode / state metrics");
+    CHECK(g_metrics.numbers["xvg.v.c.bcu.remaining"] == -1, "remaining ff ff -> -1 (none)");
     inject_bap_status(v, bap::egolf::FUNC_CHARGE_STATE, {0x1b, 0x3e, 0xff, 0xff, 0xff, 0xff, 0x00, 0xff, 0x01});
     CHECK(MyNotify.count == 3 && MyNotify.last_subtype == "xvg.charge" &&
           MyNotify.last_value == "Charging stopped: aborted: power supply not available (unconfirmed)",
@@ -1407,7 +1415,7 @@ void test_status_abort_notifications() {
     // PlugState: locked + plugged, then an unlock error.
     inject_bap_status(v, bap::egolf::FUNC_PLUG_STATE, {0x1f, 0x11});
     CHECK(str_metric("xvg.v.c.plug.state") == "plugged" &&
-          str_metric("xvg.v.c.plug.lock") == "locked (unconfirmed)" &&
+          str_metric("xvg.v.c.plug.lock") == "locked" &&
           str_metric("xvg.v.c.plug.lockerror") == "no error", "plug metrics");
     inject_bap_status(v, bap::egolf::FUNC_PLUG_STATE, {0x13, 0x11});
     CHECK(MyNotify.count == 4 && MyNotify.last_value == "Charge port lock: unlock error (unconfirmed)",
@@ -1444,6 +1452,7 @@ void test_status_from_getall_and_sleep() {
     CHECK(str_metric("xvg.v.env.climate.raw") == "11 00 00 0a 00 cc 10", "raw keeps the last bytes seen");
     CHECK(str_metric("xvg.v.c.plug.state") == "plugged" && str_metric("xvg.v.c.plug.supply") == "active" &&
           str_metric("xvg.v.c.bcu.state") == "running", "asleep -> plug / charge metrics keep their values");
+    CHECK(g_metrics.numbers["xvg.v.c.bcu.remaining"] == 175, "asleep -> remaining time keeps 175 min");
 
     // Next wake: the charge was aborted while the car slept -> still notifies.
     inject_bap_status(v, bap::egolf::FUNC_CHARGE_STATE, {0x1b, 0x4c, 0xff, 0xff, 0xff, 0xff, 0x00, 0xff, 0x11});

@@ -262,7 +262,7 @@ extern StandardMetricsType StandardMetrics;
 static constexpr int SM_STALE_MIN = 60;
 static constexpr int SM_STALE_MID = 120;
 struct OvmsMetrics {
-    OvmsMetricInt* InitInt(const char* name, int /*autostale*/ = 0, int value = 0) {
+    OvmsMetricInt* InitInt(const char* name, int /*autostale*/ = 0, int value = 0, int /*units*/ = 0) {
         // Real OVMS metrics are singletons by name owned by the framework for the process
         // lifetime; mirror that so repeated registrations return the same object and the harness
         // owns every allocation (no per-vehicle leak — the registry frees them at exit).
