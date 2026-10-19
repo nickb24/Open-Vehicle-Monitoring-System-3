@@ -694,7 +694,8 @@ static void vwe_hex(const uint8_t* b, uint16_t len, char* out, size_t cap) {
 
 void VWeGolfBatteryControl::InitStatusMetrics() {
     // The BCU sends each property about every 13 s while awake, so SM_STALE_MID (not MIN) keeps them
-    // fresh between heartbeats. ClearStatus() sets "no data" while the bus sleeps.
+    // fresh between heartbeats. "no data" = nothing heard yet; ClearStatus() resets the climate ones
+    // while the bus sleeps.
     m_ms_climate_state       = MyMetrics.InitString("xvg.v.env.climate.state", SM_STALE_MID, "no data");
     m_ms_climate_heaterstate = MyMetrics.InitString("xvg.v.env.climate.heaterstate", SM_STALE_MID, "no data");
     m_ms_climate_mode        = MyMetrics.InitString("xvg.v.env.climate.mode", SM_STALE_MID, "none");
@@ -851,9 +852,13 @@ void VWeGolfBatteryControl::HandlePlugState(const uint8_t* body, uint16_t len, c
 }
 
 void VWeGolfBatteryControl::ClearStatus() {
+    // Climate can't run while the bus sleeps, so its metrics reset. Charging CAN continue with the bus
+    // asleep (seen on-car with AC charging), so the plug / charge metrics keep their last values (they
+    // go stale after SM_STALE_MID) and their last states stay the base for the abort notifications:
+    // a charge found aborted at the next wake (e.g. the supply failed overnight) still notifies.
     m_status_cleared = true;
-    for (auto& s : m_status_seen) s.len = 0;
-    m_cs_state = m_chs_state = m_plug_lock_state = 0xFF;  // no notification for the first state at wake
+    for (auto& s : m_status_seen) s.len = 0;  // log each property once at the next wake
+    m_cs_state = 0xFF;                        // no climate notification for the first state at wake
     m_cs_age = 0xFF;
     if (m_ms_climate_state == nullptr) return;
     m_ms_climate_state->SetValue("no data");
@@ -863,12 +868,6 @@ void VWeGolfBatteryControl::ClearStatus() {
     m_ms_front_window->SetValue(false);
     StandardMetrics.ms_v_env_heating->SetValue(false);
     StandardMetrics.ms_v_env_cooling->SetValue(false);
-    m_ms_charge_mode->SetValue("no data");
-    m_ms_charge_state->SetValue("no data");
-    m_ms_plug_state->SetValue("no data");
-    m_ms_plug_supply->SetValue("no data");
-    m_ms_plug_lock->SetValue("no data");
-    m_ms_plug_lockerror->SetValue("no data");
 }
 
 bool VWeGolfBatteryControl::BapClimateAuthoritative() const {

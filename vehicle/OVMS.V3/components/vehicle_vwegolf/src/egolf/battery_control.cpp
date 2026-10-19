@@ -242,7 +242,7 @@ const ValueName kChargeModes[] = {
 const ValueName kChargeStates[] = {
   {CHS_INIT, "init", false},
   {CHS_IDLE, "idle", true},
-  {CHS_RUNNING, "running", false},
+  {CHS_RUNNING, "running", true},  // [WIRE 2026-10-18: AC charging, 0x12]
   {CHS_CONSERVATION, "conservation", false},
   {CHS_ABORT_TEMP_LOW, "aborted: temperature too low", false},
   {CHS_ABORT_DEVICE_ERROR, "aborted: device error", false},
@@ -262,7 +262,7 @@ const ValueName kPlugLockStates[] = {
 };
 const ValueName kPlugSupplies[] = {
   {0, "inactive", true},
-  {1, "active", false},
+  {1, "active", true},     // [WIRE 2026-10-18: while charging]
   {2, "charging station connected", false},
   {15, "init", false},
 };

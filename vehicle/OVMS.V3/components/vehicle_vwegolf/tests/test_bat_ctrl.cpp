@@ -1398,7 +1398,7 @@ void test_status_abort_notifications() {
     // ChargeState: running (AC) -> power supply not available.
     inject_bap_status(v, bap::egolf::FUNC_CHARGE_STATE, {0x12, 0x3e, 0xff, 0xff, 0xff, 0xff, 0x00, 0xff, 0x01});
     CHECK(str_metric("xvg.v.c.bcu.mode") == "AC (unconfirmed)" &&
-          str_metric("xvg.v.c.bcu.state") == "running (unconfirmed)", "charge mode / state metrics");
+          str_metric("xvg.v.c.bcu.state") == "running", "charge mode / state metrics");
     inject_bap_status(v, bap::egolf::FUNC_CHARGE_STATE, {0x1b, 0x3e, 0xff, 0xff, 0xff, 0xff, 0x00, 0xff, 0x01});
     CHECK(MyNotify.count == 3 && MyNotify.last_subtype == "xvg.charge" &&
           MyNotify.last_value == "Charging stopped: aborted: power supply not available (unconfirmed)",
@@ -1417,10 +1417,12 @@ void test_status_abort_notifications() {
 }
 
 // The GetAll reply that answers every channel open carries all three properties: the state is known
-// right at wake. The bus going to sleep then sets "no data" and clears the running flags.
+// right at wake. The bus going to sleep resets the climate metrics but keeps plug / charge (charging
+// continues with the bus asleep), and a charge abort found at the next wake still notifies.
 void test_status_from_getall_and_sleep() {
     printf("\ntest_status_from_getall_and_sleep\n");
     g_metrics = MetricStore{};
+    MyNotify = OvmsNotify{};
     auto* v = new OvmsVehicleVWeGolf();
 
     inject_bap_status(v, bap::egolf::FUNC_BAP_GETALL, kGetAll);
@@ -1432,12 +1434,21 @@ void test_status_from_getall_and_sleep() {
 
     inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, kCsWindow);
     CHECK(hvac_on() && bool_metric("xvg.v.env.heated_front_window"), "running with windscreen");
+    // AC charging (on-car bytes), then the bus goes to sleep while the car keeps charging.
+    inject_bap_status(v, bap::egolf::FUNC_CHARGE_STATE, {0x12, 0x4a, 0xaf, 0x00, 0xff, 0xff, 0x00, 0xff, 0x11});
+    inject_bap_status(v, bap::egolf::FUNC_PLUG_STATE, {0x1f, 0x11});
     for (int i = 0; i <= 10; i++) call_ticker1(v, i);  // no frames: the bus goes to sleep
-    CHECK(str_metric("xvg.v.env.climate.state") == "no data" && str_metric("xvg.v.c.plug.state") == "no data",
-          "asleep -> 'no data'");
+    CHECK(str_metric("xvg.v.env.climate.state") == "no data", "asleep -> climate state 'no data'");
     CHECK(!hvac_on() && !bool_metric("xvg.v.env.heated_front_window") && !bool_metric("ms_v_env_heating"),
           "asleep -> hvac / windscreen / heating off");
     CHECK(str_metric("xvg.v.env.climate.raw") == "11 00 00 0a 00 cc 10", "raw keeps the last bytes seen");
+    CHECK(str_metric("xvg.v.c.plug.state") == "plugged" && str_metric("xvg.v.c.plug.supply") == "active" &&
+          str_metric("xvg.v.c.bcu.state") == "running", "asleep -> plug / charge metrics keep their values");
+
+    // Next wake: the charge was aborted while the car slept -> still notifies.
+    inject_bap_status(v, bap::egolf::FUNC_CHARGE_STATE, {0x1b, 0x4c, 0xff, 0xff, 0xff, 0xff, 0x00, 0xff, 0x11});
+    CHECK(MyNotify.count == 1 && MyNotify.last_subtype == "xvg.charge",
+          "charge aborted while asleep -> notified at wake");
 
     // A climate start still runs with ClimateState frames interleaved.
     v->CommandClimateControl(true);

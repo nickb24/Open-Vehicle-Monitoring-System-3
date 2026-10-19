@@ -256,7 +256,8 @@ class VWeGolfBatteryControl {
     void HandleClimateState(const uint8_t* body, uint16_t len, const char* kind, bool changed);
     void HandleChargeState(const uint8_t* body, uint16_t len, const char* kind, bool changed);
     void HandlePlugState(const uint8_t* body, uint16_t len, const char* kind, bool changed);
-    // Bus asleep: the BCU is silent, so the status metrics read "no data" (and nothing is running).
+    // Bus asleep: the BCU is silent. Climate metrics read "no data" / off (climate can't run asleep);
+    // plug / charge metrics keep their last values, since charging continues with the bus asleep.
     void ClearStatus();
     // Whether the BCU's ClimateState currently owns v.e.hvac (fresh, and describing a BCU climate
     // session rather than "ignition on" / "init"); otherwise the clima ECU's 0x5EA bit decides.
@@ -322,7 +323,8 @@ class VWeGolfBatteryControl {
     // Passive status state. m_status_seen[] holds each property's last body (index 0 = PlugState,
     // 1 = ChargeState, 2 = ClimateState) for change detection; len 0 = log the next one regardless
     // (reset at the start of each command and on sleep). The *_state members are the last decoded
-    // values (0xFF = none since wake), used for the abort-transition notifications and v.e.hvac.
+    // values (0xFF = none yet), used for the abort-transition notifications and v.e.hvac; the climate
+    // one resets on sleep, the charge / plug ones persist across sleep (charging continues asleep).
     static constexpr uint8_t kClimateFreshSecs = 30;  // ClimateState heartbeat is ~13 s
     struct StatusSeen { uint8_t raw[12]; uint8_t len; };
     StatusSeen m_status_seen[3]   = {};

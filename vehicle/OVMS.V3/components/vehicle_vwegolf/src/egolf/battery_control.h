@@ -601,7 +601,9 @@ inline bool climateStateIsAbort(uint8_t s) {
 // ChargeState (func 0x11), 9 bytes [WIRE]:
 //   [0]   chargeMode (high nibble, ChargeModeValue) | chargeState (low nibble, ChargeStateValue)
 //   [1]   SOC % (0xFF = unknown, e.g. right after wake) [WIRE: matched the car at 82 % and 62 %]
-//   [2-8] not decoded (ff ff ff ff 00 ff 01 when not charging)
+//   [2-8] not decoded (ff ff ff ff 00 ff 01 when not charging). While AC charging (2026-10-18):
+//         "12 49 be 00 ff ff 00 ff 11", later "12 4a af 00 …": [2-3] counted down 190 -> 175, probably
+//         the remaining charge time in minutes (u16le); [8] reads 0x11 instead of 0x01.
 constexpr uint16_t kChargeStateMinLen = 2;
 
 enum ChargeModeValue : uint8_t {
