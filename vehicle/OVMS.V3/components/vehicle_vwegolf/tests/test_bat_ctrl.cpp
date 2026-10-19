@@ -1283,7 +1283,7 @@ void test_status_decoders_and_names() {
     CHECK(decodePlugState(pb, 2, ps) && ps.lockSetup == 0 && ps.lockState == 15 && ps.supplyState == 0 &&
           ps.plugState == 0, "PlugState 0f 00 = unlocked / no error / inactive / unplugged");
     plugStateName(1, s, sizeof(s));
-    CHECK(strcmp(s, "plugged (unconfirmed)") == 0, "plug 1 = plugged (unconfirmed)");
+    CHECK(strcmp(s, "plugged") == 0, "plug 1 = plugged (confirmed on-car)");
 
     // GetAll split against the real 79-byte reply.
     const uint8_t* val = nullptr;
@@ -1406,7 +1406,7 @@ void test_status_abort_notifications() {
 
     // PlugState: locked + plugged, then an unlock error.
     inject_bap_status(v, bap::egolf::FUNC_PLUG_STATE, {0x1f, 0x11});
-    CHECK(str_metric("xvg.v.c.plug.state") == "plugged (unconfirmed)" &&
+    CHECK(str_metric("xvg.v.c.plug.state") == "plugged" &&
           str_metric("xvg.v.c.plug.lock") == "locked (unconfirmed)" &&
           str_metric("xvg.v.c.plug.lockerror") == "no error", "plug metrics");
     inject_bap_status(v, bap::egolf::FUNC_PLUG_STATE, {0x13, 0x11});

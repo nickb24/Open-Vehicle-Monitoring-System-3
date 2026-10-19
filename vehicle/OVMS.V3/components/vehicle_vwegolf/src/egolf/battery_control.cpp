@@ -268,7 +268,7 @@ const ValueName kPlugSupplies[] = {
 };
 const ValueName kPlugStates[] = {
   {0, "unplugged", true},
-  {1, "plugged", false},
+  {1, "plugged", true},   // [WIRE 2026-10-18: car plugged in and charging]
   {15, "init", false},
 };
 }  // namespace
