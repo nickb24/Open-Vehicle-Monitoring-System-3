@@ -57,6 +57,8 @@ class OvmsVehicleVWeGolf : public OvmsVehicle {
     ~OvmsVehicleVWeGolf();
 
     void IncomingFrameCan3(CAN_frame_t* p_frame) override;
+    // FCAN (can2, listen-only): charging fallback while KCAN sleeps (see the constructor).
+    void IncomingFrameCan2(CAN_frame_t* p_frame) override;
 
     vehicle_command_t CommandHorn();
     vehicle_command_t CommandPanic();
@@ -78,6 +80,12 @@ class OvmsVehicleVWeGolf : public OvmsVehicle {
     void Ticker1(uint32_t ticker) override;
 
  private:
+    // Decode one frame into metrics. Called for every KCAN frame, and for the FCAN charging set while
+    // KCAN sleeps — so it must not touch KCAN bus state (idle counter, OCU keepalive).
+    void DecodeFrame(CAN_frame_t* p_frame);
+    // Program can2's MCP2515 acceptance filter so only the FCAN charging set reaches the CPU.
+    void SetFcanFilter();
+
     // Awake / drivable state, derived from the terminal (0x3C0 KL_15) and READY
     // (0x391) frames in IncomingFrameCan3.
     bool m_kl15_on = false;

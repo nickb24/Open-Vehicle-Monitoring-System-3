@@ -92,9 +92,14 @@ static int replay_crtd(OvmsVehicleVWeGolf* v, const char* path) {
         frame.FIR.B.DLC = dlc;
 
         if (bus == 3) {
-            // KCAN is the only bus the module taps: everything it reads (incl. gear 0x187 and
-            // VIN 0x6B4) is gatewayed onto KCAN, so IncomingFrameCan3 decodes all of it.
+            // KCAN: everything the module reads (incl. gear 0x187 and VIN 0x6B4) is gatewayed onto
+            // KCAN while it is awake, so IncomingFrameCan3 decodes all of it.
+            frame.origin = v->m_can3;
             v->IncomingFrameCan3(&frame);
+        } else if (bus == 2) {
+            // FCAN: the charging fallback, used only while KCAN is idle (IncomingFrameCan2).
+            frame.origin = v->m_can2;
+            v->IncomingFrameCan2(&frame);
         } else {
             continue;
         }

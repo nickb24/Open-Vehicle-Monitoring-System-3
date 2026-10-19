@@ -30,6 +30,9 @@
 #include <cstdlib>  // atoi — parse timer slot / profile args
 #include <cstring>  // strchr / strlen — tokenize the weekday list
 #include "vehicle_vwegolf.h"
+#ifndef VWEGOLF_NATIVE_TEST
+#include "mcp2515.h"  // FCAN (can2) hardware acceptance filter
+#endif
 
 #undef TAG
 #define TAG "v-vwegolf"
@@ -46,11 +49,17 @@ OvmsVehicleVWeGolf::OvmsVehicleVWeGolf() {
 
     // The J533 gateway rebroadcasts the powertrain/HV frames the module reads — gear (0x187),
     // VIN (0x6B4), SoC, pack current/voltage, speed — onto KCAN (CAN3) with the comfort/clima traffic,
-    // so a single KCAN tap sees everything (confirmed in drive captures: gear and VIN both appear on
-    // KCAN). FCAN (CAN2) therefore carries nothing KCAN doesn't; tapping it only adds a second MCP2515's
-    // RX/ISR load, so leave it unregistered. CAN1 (OBD) is diagnostic-only and inaccessible while asleep.
-    //RegisterCanBus(2, CAN_MODE_LISTEN, CAN_SPEED_500KBPS);  // FCAN — not tapped (all read ids are on KCAN)
+    // so a single KCAN tap sees everything while KCAN is awake (confirmed in drive captures: gear and
+    // VIN both appear on KCAN). CAN1 (OBD) is diagnostic-only and inaccessible while asleep.
     RegisterCanBus(3, CAN_MODE_ACTIVE, CAN_SPEED_500KBPS);  // KCAN — comfort / clima (everything we read)
+
+    // FCAN (CAN2), listen-only, as a fallback for charging: the car keeps AC charging with KCAN asleep,
+    // and FCAN then still carries the BCU status (0x17332510) and the charge / battery frames, with the
+    // same payloads as on KCAN (fcan-all.crtd, 2026-10-18). Listen mode never transmits, so it can't wake
+    // or disturb the bus. FCAN runs ~900 frames/s; the MCP2515 hardware filter passes only that set
+    // (~70/s), see SetFcanFilter(). Frames are used only while KCAN is idle (IncomingFrameCan2).
+    RegisterCanBus(2, CAN_MODE_LISTEN, CAN_SPEED_500KBPS);
+    SetFcanFilter();
 
     // The climate controller drives the BCU over the KCAN (comfort) bus.
     m_batctrl.SetBus(m_can3);
@@ -137,6 +146,59 @@ OvmsVehicleVWeGolfInit::OvmsVehicleVWeGolfInit() {
     MyVehicleFactory.RegisterVehicle<OvmsVehicleVWeGolf>("VWEG", "VW e-Golf");
 }
 
+void OvmsVehicleVWeGolf::SetFcanFilter() {
+#ifndef VWEGOLF_NATIVE_TEST
+    // NB mcp2515::Start() disables the filters, so this must run after the bus is started. If can2 is
+    // restarted later (e.g. from the shell), every FCAN frame reaches IncomingFrameCan2 again, which
+    // still ignores all but the charging set.
+    mcp2515* bus = (mcp2515*)m_can2;
+    if (bus == nullptr) {
+        ESP_LOGW(TAG, "can2 not available: FCAN charging fallback has no hardware filter");
+        return;
+    }
+    mcp2515_filter_config_t cfg = {};
+    // Mask 0 / filters 0-1 (RX buffer 0): the BCU status id, extended, exact match.
+    const uint32_t bcu = bap::egolf::kCanIdStatus;  // 0x17332510
+    cfg.mask[0].b.sid = 0x7FF;
+    cfg.mask[0].b.eid = 0x3FFFF;
+    cfg.filter[0].b.sid = (bcu >> 18) & 0x7FF;
+    cfg.filter[0].b.eid = bcu & 0x3FFFF;
+    cfg.filter[0].b.exide = 1;
+    cfg.filter[1] = cfg.filter[0];
+    // Mask 1 / filters 2-5 (RX buffer 1): standard ids with the low nibble don't-care. The EID mask
+    // stays 0, so data bytes 0-1 are not compared. On FCAN each pattern matches only wanted frames:
+    // 0x13x = 0x131, 0x19x = 0x191, 0x59x = 0x594 + 0x59E, 0x5Cx = 0x5CA (fcan-all.crtd). Range
+    // (0x5F5) doesn't fit, so it only updates while KCAN is awake.
+    cfg.mask[1].b.sid = 0x7F0;
+    cfg.filter[2].b.sid = 0x130;
+    cfg.filter[3].b.sid = 0x190;
+    cfg.filter[4].b.sid = 0x590;
+    cfg.filter[5].b.sid = 0x5C0;
+    if (bus->SetAcceptanceFilter(cfg) != ESP_OK)
+        ESP_LOGW(TAG, "FCAN hardware filter not set: all FCAN frames reach the software filter");
+#endif
+}
+
+void OvmsVehicleVWeGolf::IncomingFrameCan2(CAN_frame_t* p_frame) {
+    // FCAN charging fallback. While KCAN is awake it carries all of these frames itself, so FCAN is
+    // ignored then: nothing is decoded twice, and KCAN alone drives the BCU commands.
+    if (m_bus_idle_ticks < VWEGOLF_BUS_TIMEOUT_SECS) return;
+    switch (p_frame->MsgID) {
+        case 0x131:  // SOC
+        case 0x191:  // BMS current / voltage / power (and charge current / power while charging)
+        case 0x594:  // HV charge management: charging, type, time to full
+        case 0x59E:  // pack temperature
+        case 0x5CA:  // energy content
+            DecodeFrame(p_frame);
+            break;
+        case 0x17332510:  // BCU status: passive only, never the KCAN command path
+            m_batctrl.IncomingFcanBapStatus(p_frame);
+            break;
+        default:
+            break;  // the hardware filter normally drops everything else
+    }
+}
+
 void OvmsVehicleVWeGolf::IncomingFrameCan3(CAN_frame_t* p_frame) {
     m_bus_idle_ticks = 0;
 
@@ -147,6 +209,10 @@ void OvmsVehicleVWeGolf::IncomingFrameCan3(CAN_frame_t* p_frame) {
         SendOcuHeartbeat();
     }
 
+    DecodeFrame(p_frame);
+}
+
+void OvmsVehicleVWeGolf::DecodeFrame(CAN_frame_t* p_frame) {
     uint8_t* d = p_frame->data.u8;
 
     uint8_t tmp_u8 = 0;

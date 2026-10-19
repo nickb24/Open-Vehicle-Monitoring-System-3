@@ -188,6 +188,10 @@ class VWeGolfBatteryControl {
     // Feed the BatteryControl BAP status frame (0x17332510) — this DRIVES the state machine
     // (channel open, profile read + arm, command confirmation, HVAC state).
     void IncomingBapStatus(const CAN_frame_t* p_frame);
+    // The same BCU status frame heard on FCAN (can2, listen-only) while KCAN sleeps, e.g. during AC
+    // charging. PASSIVE only: status metrics and the timer cache, never the command state machine. Uses
+    // its own reassembler (both buses carry the BCU while KCAN is awake; sharing one would mix them).
+    void IncomingFcanBapStatus(const CAN_frame_t* p_frame);
     // Feed the clima ECU status frame (0x5EA) — the HVAC conditioning bit.
     void IncomingClimaEcuStatus(const CAN_frame_t* p_frame);
 
@@ -248,6 +252,9 @@ class VWeGolfBatteryControl {
     // Timer STATUS/HEARTBEAT handler: drive the in-flight timer command off the (already-updated) cache
     // — write once the enable mask is known, confirm on the 49 53 echo, finish a list. RX task only.
     void HandleTimerStatus(const bap::Element& el);
+    // Ambient BCU broadcasts, from either bus: the timer cache and the status properties below.
+    void HandleAmbientStatus(const bap::Element& el);
+
     // ---- Passive BCU status: PlugState 0x10 / ChargeState 0x11 / ClimateState 0x12 ----------------
     // Every status / heartbeat (and the copies inside a GetAll reply) updates the metrics; a change also
     // logs one line, and an abort transition notifies. RX task only, except ClearStatus (Ticker1).
@@ -326,13 +333,17 @@ class VWeGolfBatteryControl {
     // values (0xFF = none yet), used for the abort-transition notifications and v.e.hvac; the climate
     // one resets on sleep, the charge / plug ones persist across sleep (charging continues asleep).
     static constexpr uint8_t kClimateFreshSecs = 30;  // ClimateState heartbeat is ~13 s
+    // No status property heard on either bus for this long = the BCU is asleep -> ClearStatus().
+    static constexpr uint8_t kStatusSilentSecs = 30;
+    uint8_t  m_status_age         = 0xFF;  // seconds since the last status property (any bus)
+    bap::AssemblerT<128, 4> m_fcan_asm;    // FCAN copy of the BCU stream (GetAll = 79 bytes)
     struct StatusSeen { uint8_t raw[12]; uint8_t len; };
     StatusSeen m_status_seen[3]   = {};
     uint8_t  m_cs_state           = 0xFF;  // last climateState
     uint8_t  m_cs_age             = 0xFF;  // seconds since the last ClimateState (saturates at 255)
     uint8_t  m_chs_state          = 0xFF;  // last chargeState
     uint8_t  m_plug_lock_state    = 0xFF;  // last plug lockState
-    bool     m_status_cleared     = false; // ClearStatus() done for the current sleep
+    bool     m_status_cleared     = false; // ClearStatus() done since the last status property
 
     OvmsMetricString* m_ms_climate_state       = nullptr;  // xvg.v.env.climate.state
     OvmsMetricString* m_ms_climate_heaterstate = nullptr;  // xvg.v.env.climate.heaterstate

@@ -1445,7 +1445,10 @@ void test_status_from_getall_and_sleep() {
     // AC charging (on-car bytes), then the bus goes to sleep while the car keeps charging.
     inject_bap_status(v, bap::egolf::FUNC_CHARGE_STATE, {0x12, 0x4a, 0xaf, 0x00, 0xff, 0xff, 0x00, 0xff, 0x11});
     inject_bap_status(v, bap::egolf::FUNC_PLUG_STATE, {0x1f, 0x11});
-    for (int i = 0; i <= 10; i++) call_ticker1(v, i);  // no frames: the bus goes to sleep
+    for (int i = 0; i <= 10; i++) call_ticker1(v, i);  // no frames: KCAN goes to sleep (10 s)
+    CHECK(!hvac_on(), "KCAN asleep -> v.e.hvac off");
+    CHECK(str_metric("xvg.v.env.climate.state") == "running", "status kept until the BCU is silent 30 s");
+    for (int i = 11; i <= 31; i++) call_ticker1(v, i);  // no BCU status on any bus for > 30 s
     CHECK(str_metric("xvg.v.env.climate.state") == "no data", "asleep -> climate state 'no data'");
     CHECK(!hvac_on() && !bool_metric("xvg.v.env.heated_front_window") && !bool_metric("ms_v_env_heating"),
           "asleep -> hvac / windscreen / heating off");
@@ -1466,6 +1469,80 @@ void test_status_from_getall_and_sleep() {
     inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, kCsIdle);
     inject_bap_status(v, bap::egolf::FUNC_PROFILES_ARRAY, make_profile0_array(0x06));
     CHECK(sent_trigger(kcan(v)), "climate start still triggers with ClimateState frames interleaved");
+
+    delete v;
+}
+
+// ---------------------------------------------------------------------------
+// FCAN (can2) charging fallback: used only while KCAN sleeps, passive only
+// ---------------------------------------------------------------------------
+
+// Frame a BCU telegram as a heartbeat and feed it on FCAN (IncomingFrameCan2).
+static void inject_fcan_bap(OvmsVehicleVWeGolf* v, uint8_t func, const std::vector<uint8_t>& body) {
+    auto sink = [&](const uint8_t* frame, uint8_t dlc) -> bool {
+        CAN_frame_t f{};
+        f.MsgID = BAP_STS_ID;
+        f.origin = v->m_can2;
+        f.FIR.B.DLC = dlc;
+        for (uint8_t i = 0; i < dlc; i++) f.data.u8[i] = frame[i];
+        v->IncomingFrameCan2(&f);
+        return true;
+    };
+    bap::sendElement(sink, bap::OP_HEARTBEAT, bap::egolf::kLsg, func, body.data(),
+                     static_cast<uint16_t>(body.size()));
+}
+
+static void fcan_frame(OvmsVehicleVWeGolf* v, uint32_t id, std::initializer_list<uint8_t> bytes) {
+    CAN_frame_t f = make_kcan_frame(v, id, bytes);
+    f.origin = v->m_can2;
+    v->IncomingFrameCan2(&f);
+}
+
+void test_fcan_charging_fallback() {
+    printf("\ntest_fcan_charging_fallback\n");
+    g_metrics = MetricStore{};
+    MyNotify = OvmsNotify{};
+    auto* v = new OvmsVehicleVWeGolf();
+    // fcan-all.crtd (2026-10-18, AC charging with KCAN asleep).
+    const std::initializer_list<uint8_t> charging594 = {0x00, 0xf0, 0x21, 0xe3, 0x01, 0x34, 0x30, 0x0e};
+    const std::initializer_list<uint8_t> soc131      = {0x00, 0x00, 0x00, 0x98, 0x00, 0x00, 0xd0, 0xff};
+
+    // KCAN awake: FCAN is ignored (KCAN carries the same frames).
+    auto kcan_frame = make_kcan_frame(v, 0x5EA, {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00});
+    v->IncomingFrameCan3(&kcan_frame);
+    fcan_frame(v, 0x594, charging594);
+    inject_fcan_bap(v, bap::egolf::FUNC_PLUG_STATE, {0x1f, 0x11});
+    CHECK(!StandardMetrics.ms_v_charge_inprogress->AsBool(), "KCAN awake: FCAN 0x594 ignored");
+    CHECK(str_metric("xvg.v.c.plug.state") == "no data", "KCAN awake: FCAN BCU status ignored");
+
+    // KCAN asleep (> 10 s without a KCAN frame): the FCAN charging set is decoded.
+    for (int i = 0; i <= 10; i++) call_ticker1(v, i);
+    fcan_frame(v, 0x594, charging594);
+    fcan_frame(v, 0x131, soc131);
+    CHECK(StandardMetrics.ms_v_charge_inprogress->AsBool(), "KCAN asleep: FCAN 0x594 -> charging");
+    CHECK(StandardMetrics.ms_v_bat_soc->AsFloat() == 76.0f, "KCAN asleep: FCAN 0x131 -> SOC 76 %");
+    inject_fcan_bap(v, bap::egolf::FUNC_PLUG_STATE, {0x1f, 0x11});
+    inject_fcan_bap(v, bap::egolf::FUNC_CHARGE_STATE, {0x12, 0x4c, 0x9b, 0x00, 0xff, 0xff, 0x00, 0xff, 0x11});
+    CHECK(str_metric("xvg.v.c.plug.state") == "plugged" && str_metric("xvg.v.c.bcu.state") == "running" &&
+          g_metrics.numbers["xvg.v.c.bcu.remaining"] == 155, "KCAN asleep: FCAN BCU status decoded");
+    fcan_frame(v, 0x5F5, {0xdb, 0x00, 0x70, 0x80, 0x14, 0x83, 0x88, 0x14});
+    CHECK(StandardMetrics.ms_v_bat_range_est->AsFloat() == 0, "FCAN ids outside the set are ignored");
+
+    // The BCU keeps reporting on FCAN: the climate state holds (no flapping to "no data").
+    bool flapped = false;
+    for (int i = 0; i < 40; i++) {
+        if (i % 13 == 0) inject_fcan_bap(v, bap::egolf::FUNC_CLIMATE_STATE, kCsIdle);
+        call_ticker1(v, 100 + i);
+        if (str_metric("xvg.v.env.climate.state") != "idle") flapped = true;
+    }
+    CHECK(!flapped, "FCAN ClimateState every 13 s: climate state stays 'idle' while KCAN sleeps");
+
+    // FCAN never drives the command path: a climate command waiting in CP_WAKE gets no handshake
+    // from an FCAN BCU frame (a KCAN one would send "19 42" / "19 41").
+    v->CommandClimateControl(true);
+    kcan(v)->tx_log.clear();
+    inject_fcan_bap(v, bap::egolf::FUNC_CHARGE_STATE, {0x12, 0x4c, 0x9a, 0x00, 0xff, 0xff, 0x00, 0xff, 0x11});
+    CHECK(ext_frames(kcan(v), BAP_CMD_ID).empty(), "FCAN BCU frame: no handshake / command TX");
 
     delete v;
 }
@@ -1770,6 +1847,7 @@ void test_bat_ctrl_all() {
     test_climate_state_owns_hvac();
     test_status_abort_notifications();
     test_status_from_getall_and_sleep();
+    test_fcan_charging_fallback();
     test_set_profile_hard_caps_current();
     test_set_profile_truncated_name_aborts();
     test_set_profile_guards();

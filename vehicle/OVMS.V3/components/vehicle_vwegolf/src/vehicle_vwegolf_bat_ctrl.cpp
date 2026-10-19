@@ -217,11 +217,13 @@ void VWeGolfBatteryControl::Ticker1(bool bus_alive) {
 
     // The clima ECU (0x5EA) and the BCU (0x17332510) go silent once the bus sleeps and so
     // can't refresh HVAC; clear it as a backstop so climate doesn't read "on" forever after
-    // conditioning ends and the car sleeps. The BCU status metrics read "no data" (once per sleep).
-    if (!bus_alive) {
-        StandardMetrics.ms_v_env_hvac->SetValue(false);
-        if (!m_status_cleared) ClearStatus();
-    }
+    // conditioning ends and the car sleeps.
+    if (!bus_alive) StandardMetrics.ms_v_env_hvac->SetValue(false);
+
+    // BCU status: reset once nothing has been heard from the BCU on EITHER bus for a while. Not on KCAN
+    // sleep alone: during AC charging KCAN sleeps but the BCU keeps reporting on FCAN.
+    if (m_status_age < 0xFF) m_status_age++;
+    if (m_status_age >= kStatusSilentSecs && !m_status_cleared) ClearStatus();
 
     if (m_phase == CP_IDLE || m_wake_hold == 0) {
         return;
@@ -388,33 +390,7 @@ void VWeGolfBatteryControl::IncomingBapStatus(const CAN_frame_t* p_frame) {
     }
     m_tx_fail = false;  // the BCU is answering, so the transmit path is healthy
 
-    // Always keep the persistent timer cache current from ambient status/broadcast — even with no
-    // command in flight — so a later set/list acts on it immediately instead of waiting for a fresh
-    // broadcast. Timer funcs only (0x13 TimerState / 0x14..0x17 slots).
-    if ((el.opcode == bap::OP_STATUS || el.opcode == bap::OP_HEARTBEAT) &&
-        (el.func == bap::egolf::FUNC_TIMER_STATE || bap::egolf::timerSlotForFunc(el.func) != 0)) {
-        UpdateTimerCache(el);
-    }
-
-    // Passive status decode (any phase, no TX): PlugState / ChargeState / ClimateState from their own
-    // status or heartbeat, and from the GetAll reply that answers every channel open, so the state is
-    // known right at wake instead of after the next ~13 s heartbeat.
-    if (el.opcode == bap::OP_STATUS || el.opcode == bap::OP_HEARTBEAT) {
-        const char* kind = el.opcode == bap::OP_HEARTBEAT ? "hb" : "status";
-        if (el.func == bap::egolf::FUNC_PLUG_STATE || el.func == bap::egolf::FUNC_CHARGE_STATE ||
-            el.func == bap::egolf::FUNC_CLIMATE_STATE) {
-            HandleStatusProperty(el.func, el.body, el.bodyLen, kind);
-        } else if (el.func == bap::egolf::FUNC_BAP_GETALL && el.opcode == bap::OP_STATUS) {
-            static const uint8_t kFuncs[] = {bap::egolf::FUNC_PLUG_STATE, bap::egolf::FUNC_CHARGE_STATE,
-                                             bap::egolf::FUNC_CLIMATE_STATE};
-            for (uint8_t f : kFuncs) {
-                const uint8_t* val = nullptr;
-                uint16_t vlen = 0;
-                if (bap::egolf::findGetAllValue(el.body, el.bodyLen, f, &val, &vlen))
-                    HandleStatusProperty(f, val, vlen, "getall");
-            }
-        }
-    }
+    HandleAmbientStatus(el);  // timer cache + status properties (passive, any phase)
 
     // The OperationMode echo "49 58 <flag>" is the immediate-operation on/off state — reflect it on
     // EVERY such frame, in any phase (including the very first frame, which also opens the handshake
@@ -684,6 +660,44 @@ void VWeGolfBatteryControl::IncomingBapStatus(const CAN_frame_t* p_frame) {
 // Passive BCU status: PlugState (0x10) / ChargeState (0x11) / ClimateState (0x12)
 // ---------------------------------------------------------------------------
 
+void VWeGolfBatteryControl::IncomingFcanBapStatus(const CAN_frame_t* p_frame) {
+    // FCAN copy of the BCU stream, only fed while KCAN sleeps (see OvmsVehicleVWeGolf::IncomingFrameCan2).
+    // Passive: no m_bcu_seen / handshake / command progress — KCAN alone drives the commands.
+    bap::Element el;
+    if (!m_fcan_asm.feed(p_frame->data.u8, p_frame->FIR.B.DLC, el) || el.lsg != bap::egolf::kLsg) return;
+    HandleAmbientStatus(el);
+}
+
+void VWeGolfBatteryControl::HandleAmbientStatus(const bap::Element& el) {
+    if (el.opcode != bap::OP_STATUS && el.opcode != bap::OP_HEARTBEAT) return;
+
+    // Always keep the persistent timer cache current from ambient status/broadcast — even with no
+    // command in flight — so a later set/list acts on it immediately instead of waiting for a fresh
+    // broadcast. Timer funcs only (0x13 TimerState / 0x14..0x17 slots).
+    if (el.func == bap::egolf::FUNC_TIMER_STATE || bap::egolf::timerSlotForFunc(el.func) != 0) {
+        UpdateTimerCache(el);
+        return;
+    }
+
+    // Passive status decode (any phase, no TX): PlugState / ChargeState / ClimateState from their own
+    // status or heartbeat, and from the GetAll reply that answers every channel open, so the state is
+    // known right at wake instead of after the next ~13 s heartbeat.
+    const char* kind = el.opcode == bap::OP_HEARTBEAT ? "hb" : "status";
+    if (el.func == bap::egolf::FUNC_PLUG_STATE || el.func == bap::egolf::FUNC_CHARGE_STATE ||
+        el.func == bap::egolf::FUNC_CLIMATE_STATE) {
+        HandleStatusProperty(el.func, el.body, el.bodyLen, kind);
+    } else if (el.func == bap::egolf::FUNC_BAP_GETALL && el.opcode == bap::OP_STATUS) {
+        static const uint8_t kFuncs[] = {bap::egolf::FUNC_PLUG_STATE, bap::egolf::FUNC_CHARGE_STATE,
+                                         bap::egolf::FUNC_CLIMATE_STATE};
+        for (uint8_t f : kFuncs) {
+            const uint8_t* val = nullptr;
+            uint16_t vlen = 0;
+            if (bap::egolf::findGetAllValue(el.body, el.bodyLen, f, &val, &vlen))
+                HandleStatusProperty(f, val, vlen, "getall");
+        }
+    }
+}
+
 // "xx xx xx" hex dump of `len` bytes into out (stops early if cap runs out).
 static void vwe_hex(const uint8_t* b, uint16_t len, char* out, size_t cap) {
     size_t l = 0;
@@ -720,6 +734,7 @@ void VWeGolfBatteryControl::HandleStatusProperty(uint8_t func, const uint8_t* bo
     const uint8_t idx = (uint8_t)(func - bap::egolf::FUNC_PLUG_STATE);  // 0x10 / 0x11 / 0x12 -> 0 / 1 / 2
     if (idx > 2) return;
     m_status_cleared = false;
+    m_status_age = 0;
 
     StatusSeen& seen = m_status_seen[idx];
     const uint8_t n = len < sizeof(seen.raw) ? (uint8_t)len : (uint8_t)sizeof(seen.raw);
