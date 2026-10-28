@@ -150,8 +150,14 @@ class OvmsVehicleVWeGolf : public OvmsVehicle {
     // and answers. Read-only — it never writes a profile.
     void CommandListProfiles(OvmsWriter* writer);
     // `xvg charge profile set` handler: RMW selected fields of one profile (profile 0 = current/minsoc/
-    // temp/frontwindow; charge locations 1-3 = flags/current/soc). Blocks (bounded) for the controller's result.
+    // temp; charge locations 1-3 = flags/current/soc). Blocks (bounded) for the controller's result.
     void CommandSetProfile(OvmsWriter* writer, int argc, const char* const* argv);
+
+    // `xvg windowheat on|off` / `xvg seatheat on|off [front|fl|fr]`: fire-and-forget remote heating
+    // (like climatecontrol). `xvg seatheat clear`: profile-0 RMW dropping the stored seat bits (blocks).
+    void CommandWindowHeat(OvmsWriter* writer, bool enable);
+    void CommandSeatHeat(OvmsWriter* writer, bool enable, int argc, const char* const* argv);
+    void CommandSeatHeatClear(OvmsWriter* writer);
 
     // `xvg charge timer ...` handlers. list = read-only; set/enable/disable/clear write to the car
     // (recurring timers only). Each blocks (bounded) for the BatteryControl controller's result.

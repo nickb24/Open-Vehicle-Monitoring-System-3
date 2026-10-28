@@ -40,10 +40,11 @@ bool readProfile(bap::Reader& r, Profile& out) {
   out.minChargeLevel = r.u8();
   out.minRange = r.u16le();
   out.targetChargeLevel = r.u8();
-  out.targetChargeDuration = r.u8();
+  out.targetChargeDuration = r.u16le();
   out.targetChargeRange = r.u16le();
-  out.unitRange = r.u8();
-  out.rangeCalculationSetup = r.u8();
+  const uint8_t range = r.u8();
+  out.unitRange = (uint8_t)(range >> 4);
+  out.rangeCalculationSetup = (uint8_t)(range & 0x0F);
   out.temperatureRaw = r.u8();
   out.temperatureUnit = r.u8();
   out.leadTime = r.u8();
@@ -65,10 +66,9 @@ size_t encodeProfile(uint8_t* out, size_t cap, const Profile& p) {
   w.u8(p.minChargeLevel);
   w.u16le(p.minRange);
   w.u8(p.targetChargeLevel);
-  w.u8(p.targetChargeDuration);
+  w.u16le(p.targetChargeDuration);
   w.u16le(p.targetChargeRange);
-  w.u8(p.unitRange);
-  w.u8(p.rangeCalculationSetup);
+  w.u8((uint8_t)((p.unitRange << 4) | (p.rangeCalculationSetup & 0x0F)));
   w.u8(p.temperatureRaw);
   w.u8(p.temperatureUnit);
   w.u8(p.leadTime);
@@ -108,14 +108,19 @@ size_t decodeProfileArray(const uint8_t* body, uint16_t bodyLen,
     uint16_t position = (uint16_t)(startIndex + i);
     if (posTransmit) position = largeIdx ? r.u16le() : r.u8();
 
-    if (recordAddr == 6) {         // compact 4-byte record: not modeled -- skip
-      r.skip(4);                   // counted toward `declared`, not written to out[]
-      continue;
-    }
-
     Profile& p = out[count];
     p = Profile();
-    if (!readProfile(r, p)) { res.malformed = true; break; }
+    if (recordAddr == 6) {         // compact 4-byte record (no temperature, no name)
+      p.operation = r.u8();
+      p.operation2 = r.u8();
+      p.maxCurrent = r.u8();
+      p.targetChargeLevel = r.u8();
+      p.compact = true;
+      if (!r.ok()) { res.malformed = true; break; }
+    } else if (!readProfile(r, p)) {
+      res.malformed = true;
+      break;
+    }
     p.position = position;
     count++;
   }
@@ -228,7 +233,7 @@ const ValueName kClimateHeaters[] = {
   {CH_SEAT_RL, "seat rear left", false},
   {CH_SEAT_RR, "seat rear right", false},
   {CH_WINDOW_FRONT, "front window", true},
-  {CH_WINDOW_REAR, "rear window", false},
+  {CH_WINDOW_REAR, "rear window", true},  // [WIRE 2026-10-27: 0x20 with 0x588 byte 2 bit 0x10]
 };
 const ValueName kChargeModes[] = {
   {CHM_OFF, "off", true},
@@ -249,6 +254,23 @@ const ValueName kChargeStates[] = {
   {CHS_ABORT_NO_SUPPLY, "aborted: power supply not available", false},
   {CHS_ABORT_NOT_IN_PARK, "aborted: not in park", false},
   {CHS_COMPLETED, "completed", false},
+};
+// ChargeState byte 8 high nibble, DSI numbering. 1 was read during a timer-1 charge, once.
+const ValueName kChargeStartReasons[] = {
+  {0, "init", false},
+  {1, "timer 1", false},
+  {2, "timer 2", false},
+  {3, "timer 3", false},
+  {4, "timer 4", false},
+  {5, "immediately", false},
+  {6, "push button", false},
+};
+// ChargeState byte 8 low nibble: HV battery conditioning.
+const ValueName kBatteryClimateStates[] = {
+  {0, "init", false},
+  {1, "off", false},
+  {2, "cooling", false},
+  {3, "heating", false},
 };
 const ValueName kPlugLockSetups[] = {
   {0, "unlocked", true},
@@ -290,6 +312,12 @@ size_t chargeModeName(uint8_t v, char* out, size_t cap) {
 }
 size_t chargeStateName(uint8_t v, char* out, size_t cap) {
   return nameOf(kChargeStates, VWE_N(kChargeStates), v, out, cap);
+}
+size_t chargeStartReasonName(uint8_t v, char* out, size_t cap) {
+  return nameOf(kChargeStartReasons, VWE_N(kChargeStartReasons), v, out, cap);
+}
+size_t batteryClimateStateName(uint8_t v, char* out, size_t cap) {
+  return nameOf(kBatteryClimateStates, VWE_N(kBatteryClimateStates), v, out, cap);
 }
 size_t plugLockSetupName(uint8_t v, char* out, size_t cap) {
   return nameOf(kPlugLockSetups, VWE_N(kPlugLockSetups), v, out, cap);

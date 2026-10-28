@@ -88,6 +88,17 @@ enum ProfileOperation : uint8_t {
   PO_CHARGING      = 0x01,  // charge at this location
   PO_CLIMATE       = 0x02,  // climatise (preconditioning)
   PO_ALLOW_BATTERY = 0x04,  // climatise without external supply (use HV battery)
+  // Upper bits per the MIB2 firmware (org.dsi.ifc.carhybrid.BatteryControlProfileOperation field
+  // order: charge, climate, climateWithoutExternalSupply, autoDefrost, seatHeaterFrontLeft,
+  // seatHeaterFrontRight, seatHeaterRearLeft, seatHeaterRearRight). The OCU's setOperation() keeps
+  // them as stored. [FW, not yet WIRE-confirmed]
+  PO_AUTO_DEFROST  = 0x08,  // automatic defrost (never set by this module)
+  PO_SEAT_FL       = 0x10,  // seat heater front left
+  PO_SEAT_FR       = 0x20,  // seat heater front right
+  PO_SEAT_RL       = 0x40,  // seat heater rear left   (protocol only; never sent by this module)
+  PO_SEAT_RR       = 0x80,  // seat heater rear right  (protocol only; never sent by this module)
+  PO_SEAT_MASK     = 0xF0,
+  PO_SEAT_FRONT    = PO_SEAT_FL | PO_SEAT_FR,
 };
 
 // ⚠⚠ HARD SAFETY LIMIT — the BCU must NEVER be written a maxCurrent above 0x20 (32 A). A higher
@@ -165,7 +176,8 @@ inline float rawToTemp(uint8_t raw) { return rawToDeciDegC(raw) / 10.0f; }
 //   [6] refId = assigned profile posId (0 = global "Optionen", 1.. = charge
 //       locations). The fired timer sources its target SoC / maxCurrent /
 //       temperature from THIS profile -- it is NOT a charge/climate mode.
-//   [7] 0x00 pad (chargeSchedule/climateSchedule are hard-zero on the e-Golf)
+//   [7] chargeSchedule (high nibble) | climateSchedule (low nibble) [FW: baphandler bap_timer1_stm].
+//       Read only: writes send 0x00, as baphandler does (always 0x00 on the e-Golf so far).
 // Firmware: DSICarHybrid.setBatteryControlTimer(id,y,m,d,h,min,weekdays,refId);
 // refId proven via BatterManagerMainController.assignProfileToTimer().
 
@@ -198,6 +210,8 @@ struct Timer {
   uint8_t minute = 0;
   uint8_t weekdays = 0;  // Weekday bitmask
   uint8_t refId = 0;     // assigned profile posId (0 = global "Optionen")
+  uint8_t chargeSchedule = 0;   // [7] high nibble (decode only)
+  uint8_t climateSchedule = 0;  // [7] low nibble (decode only)
   // [0:2] is a next-fire date. Observed: one-shot timers carry the date; recurring
   // timers carry 0xFF/0xFF/0xFF (they fire by weekday, no single date). NB the
   // timer's enable/disable is a SEPARATE message (func 0x13 TimerState), not this
@@ -220,11 +234,13 @@ inline bool decodeTimer(const uint8_t* rec, uint16_t len, Timer& out) {
   out = Timer();
   out.year = rec[0]; out.month = rec[1]; out.day = rec[2];
   out.hour = rec[3]; out.minute = rec[4]; out.weekdays = rec[5]; out.refId = rec[6];
+  out.chargeSchedule = (uint8_t)(rec[7] >> 4); out.climateSchedule = (uint8_t)(rec[7] & 0x0F);
   return true;
 }
 
-// TimerState (func 0x13): 2-byte body {enabledMask, 0x00}; bit i => timer (i+1)
-// programmed/enabled. [FW+WIRE]
+// TimerState (func 0x13): 2-byte body {enabledMask, expiredMask}; bit i => timer (i+1)
+// programmed/enabled. [FW+WIRE] Byte 1 is baphandler's bap_expired_timer [FW]: read 01 while a
+// timer-1 charge ran, 00 idle [WIRE 2026-10-18]. Writes send 0x00 there.
 inline size_t encodeTimerState(uint8_t* out, size_t cap, uint8_t enabledMask) {
   if (cap < 2) return 0;
   out[0] = (uint8_t)(enabledMask & 0x0F); out[1] = 0x00; return 2;
@@ -287,13 +303,17 @@ inline bool decodePowerProviderRA2(const uint8_t* rec, uint16_t len, PowerProvid
 // Two-byte body. PROVEN on the wire (command id 0x17332501): {0x00,0x01} starts
 // the immediate/global profile (profile 0), {0x00,0x00} stops it.
 //
-// The byte model for NON-global (timer) profiles is UNRESOLVED -- two RE sources
-// disagree and no capture exercises it:
-//   * OCU firmware:  {0x00, bitmap}    bit0=profile0, bits 1..3=timer 1..3
-//   * MIB2 firmware: {profileId, ctl}  byte0 selects the profile, byte1 = 0/1
-// Both collapse to {0x00,0x01}/{0x00,0x00} for the global case, which is all the
-// captures show. Only the proven global start/stop is exposed, plus a raw builder;
-// neither timer model is baked in.
+// Byte model: {profileId, ctl} -- byte0 selects the profile, byte1 = 1 start / 0
+// stop. Used by the MIB2 firmware and by the OCU's baphandler 3.81.81
+// (bap_handle_immediately_control_stm), which sends it as a BAP method (SetGet,
+// answered by Processing 39 58 / Result 49 58). [FW] (An earlier OCU reading of
+// {0x00, bitmap} is superseded.) Only profile 0 is proven on the wire, so only the
+// global start/stop is exposed, plus a raw builder.
+//
+// The trigger always acts on what profile 0 is armed for: cabin climate (op 0x06,
+// op2 0x00), window heating (op 0x04, op2 0x03) or charge (op 0x01). The OCU runs
+// climate and window heating as separate arm + trigger sequences and never sends
+// both in one profile write. [FW: RemotePreTripClimatisation*]
 inline void buildOperationModeRaw(uint8_t (&body)[2], uint8_t b0, uint8_t b1) {
   body[0] = b0;
   body[1] = b1;
@@ -314,10 +334,11 @@ inline void buildClimateStop(uint8_t (&body)[2])  { buildOperationModeRaw(body, 
 //   [3]  minChargeLevel (%)                       [WIRE]
 //   [4-5] minRange (LE u16)                        [RE]
 //   [6]  targetChargeLevel (%)                    [WIRE]
-//   [7]  targetChargeDuration                       [RE]
-//   [8-9] targetChargeRange (LE u16)                [RE]
-//   [10] unitRange                                  [RE]
-//   [11] rangeCalculationSetup                      [RE]
+//   [7-8] targetChargeDuration (LE u16)             [RE]
+//   [9-10] targetChargeRange (LE u16)               [RE]
+//   [11] unitRange (high nibble) | rangeCalculationSetup (low nibble)  [RE]
+//        (widths of [7..11] per baphandler bap_send_profile_setget; all bytes are
+//        still read and written verbatim, so the RMW is unaffected)
 //   [12] temperature (raw; see tempToRaw)          [WIRE]
 //   [13] temperatureUnit                            [RE]
 //   [14] leadTime                                   [RE]
@@ -337,10 +358,10 @@ struct Profile {
   uint8_t minChargeLevel = 0;
   uint16_t minRange = 0;
   uint8_t targetChargeLevel = 0;
-  uint8_t targetChargeDuration = 0;
+  uint16_t targetChargeDuration = 0;
   uint16_t targetChargeRange = 0;
-  uint8_t unitRange = 0;
-  uint8_t rangeCalculationSetup = 0;
+  uint8_t unitRange = 0;              // [11] high nibble
+  uint8_t rangeCalculationSetup = 0;  // [11] low nibble
   uint8_t temperatureRaw = 0;
   uint8_t temperatureUnit = 0;
   uint8_t leadTime = 0;
@@ -351,6 +372,9 @@ struct Profile {
   char name[kProfileMaxName + 1] = {0};  // NUL-terminated for convenience
   bool nameTruncated = false;  // true if the on-wire name exceeded kProfileMaxName
   uint16_t position = 0;  // array position index (from a PosTransmit STATUS array)
+  // Decoded from a compact RecordAddr 6 element: only operation, operation2, maxCurrent and
+  // targetChargeLevel are real, everything else is zero. Never use one as a read-modify-write base.
+  bool compact = false;
 };
 
 // Encode a full profile record into `out` (capacity `cap`). Returns the number
@@ -387,8 +411,10 @@ struct ArrayResult {
 //   [4] elementCount   (2 bytes, LE, if LargeIdx=1)
 //   then, per element: [position (1 or 2 bytes) if PosTransmit] + record
 //
-// This decoder handles RecordAddr=0 (the 20-byte full record). Only the full
-// format has been observed; compact (RecordAddr=6, 4 bytes) elements are skipped.
+// This decoder handles RecordAddr=0 (the 20-byte full record) and RecordAddr=6
+// (4 bytes: operation, operation2, maxCurrent, targetChargeLevel), which comes out
+// with Profile::compact set. Only the full format has been observed; baphandler
+// decodes RA0..RA7, but only ever writes RA0. Other record types are not modeled.
 // The global "Optionen"/immediate profile is element 0; it holds the climate
 // target temperature and global charge limits.
 //
@@ -526,8 +552,13 @@ bap::SendResult sendClimateSequence(Sink&& sink, bool on) {
 
 // ClimateState (func 0x12), 7 bytes [WIRE]:
 //   [0]   climateMode bits (ClimateMode)
-//   [1-4] not decoded (always 00 00 0a 00 so far; [3] = 10 is probably the session length in minutes)
+//   [1]   temperature raw [FW: baphandler] (same encoding as the profile temperature, see
+//         rawToDeciDegC; 0 = none). Read 0 in every capture so far, even with climate running.
+//   [2]   temperature unit [FW] (0 = Celsius, 1 = Fahrenheit)
+//   [3-4] climating time raw, u16le [FW]. baphandler subtracts 0x78 (120), but every capture so far
+//         reads 10 (00 00 0a 00), which would be -110 min, so the meaning is unclear: kept raw.
 //   [5]   climateState (high nibble, ClimateStateValue) | seatheaterWindowState (low nibble, same numbers)
+//         -- the BCU runs cabin climate and seat / window heating as two separate state machines
 //   [6]   seat / window heater bits (ClimateHeater)
 constexpr uint16_t kClimateStateLen = 7;
 
@@ -546,7 +577,7 @@ enum ClimateHeater : uint8_t {
   CH_SEAT_RL      = 0x04,  // [FW]
   CH_SEAT_RR      = 0x08,  // [FW]
   CH_WINDOW_FRONT = 0x10,  // [WIRE] windscreen heating running
-  CH_WINDOW_REAR  = 0x20,  // [FW]
+  CH_WINDOW_REAR  = 0x20,  // [WIRE 2026-10-27] rear window heating running (xvg windowheat)
 };
 
 enum ClimateStateValue : uint8_t {
@@ -568,15 +599,21 @@ enum ClimateStateValue : uint8_t {
 };
 
 struct ClimateState {
-  uint8_t mode = 0;         // [0] ClimateMode bits
-  uint8_t state = 0;        // [5] high nibble: ClimateStateValue
-  uint8_t heaterState = 0;  // [5] low nibble: seatheaterWindowState (ClimateStateValue numbers)
-  uint8_t heaters = 0;      // [6] ClimateHeater bits
+  uint8_t mode = 0;               // [0] ClimateMode bits
+  uint8_t temperatureRaw = 0;     // [1] 0 = none
+  uint8_t temperatureUnit = 0;    // [2]
+  uint16_t climatingTimeRaw = 0;  // [3-4] u16le, meaning unclear (see above)
+  uint8_t state = 0;              // [5] high nibble: ClimateStateValue
+  uint8_t heaterState = 0;        // [5] low nibble: seatheaterWindowState (ClimateStateValue numbers)
+  uint8_t heaters = 0;            // [6] ClimateHeater bits
 };
 inline bool decodeClimateState(const uint8_t* b, uint16_t len, ClimateState& out) {
   if (len < kClimateStateLen) return false;
   out = ClimateState();
   out.mode = b[0];
+  out.temperatureRaw = b[1];
+  out.temperatureUnit = b[2];
+  out.climatingTimeRaw = (uint16_t)(b[3] | ((uint16_t)b[4] << 8));
   out.state = (uint8_t)(b[5] >> 4);
   out.heaterState = (uint8_t)(b[5] & 0x0F);
   out.heaters = b[6];
@@ -593,8 +630,12 @@ inline bool climateStateIsAbort(uint8_t s) {
 //   [1]   SOC % (0xFF = unknown, e.g. right after wake) [WIRE: matched the car at 82 % and 62 %]
 //   [2-3] remaining charge time, minutes, u16le; 0xFFFF = none [WIRE 2026-10-18, AC charging: counted
 //         down 190 -> 175, while 0x594's time-to-full read 170 min a few minutes later]
-//   [4-8] not decoded (ff ff 00 ff 01 when idle, ff ff 00 ff 11 while AC charging)
+//   [4-7] not decoded (ff ff 00 ff so far)
+//   [8]   startReason (high nibble) | batteryClimateState (low nibble) [FW: baphandler]. Read 0x01 idle
+//         and 0x11 during a timer-1 charge [WIRE 2026-10-18]: startReason 1 fits the DSI enum (1 = timer
+//         1, 5 = immediately), not the tracker reading "1 = immediate", so the DSI names are used.
 constexpr uint16_t kChargeStateMinLen = 2;
+constexpr uint16_t kChargeStateLen = 9;
 
 enum ChargeModeValue : uint8_t {
   CHM_OFF = 0, CHM_AC = 1, CHM_DC = 2, CHM_CONDITIONING = 3, CHM_AC_CONDITIONING = 4,
@@ -610,6 +651,9 @@ struct ChargeState {
   uint8_t state = 0;              // ChargeStateValue
   uint8_t soc = 0xFF;             // %, 0xFF = unknown
   uint16_t remainingMin = 0xFFFF; // remaining charge time, minutes; 0xFFFF = none
+  bool has8 = false;              // byte 8 present (the fields below are valid)
+  uint8_t startReason = 0;        // [8] high nibble
+  uint8_t batteryClimateState = 0;  // [8] low nibble
 };
 inline bool decodeChargeState(const uint8_t* b, uint16_t len, ChargeState& out) {
   if (len < kChargeStateMinLen) return false;
@@ -618,6 +662,11 @@ inline bool decodeChargeState(const uint8_t* b, uint16_t len, ChargeState& out) 
   out.state = (uint8_t)(b[0] & 0x0F);
   out.soc = b[1];
   if (len >= 4) out.remainingMin = (uint16_t)(b[2] | ((uint16_t)b[3] << 8));
+  if (len >= kChargeStateLen) {
+    out.has8 = true;
+    out.startReason = (uint8_t)(b[8] >> 4);
+    out.batteryClimateState = (uint8_t)(b[8] & 0x0F);
+  }
   return true;
 }
 inline bool chargeStateIsAbort(uint8_t s) {
@@ -654,6 +703,8 @@ size_t climateModeNames(uint8_t bits, char* out, size_t cap);
 size_t climateHeaterNames(uint8_t bits, char* out, size_t cap);
 size_t chargeModeName(uint8_t v, char* out, size_t cap);
 size_t chargeStateName(uint8_t v, char* out, size_t cap);
+size_t chargeStartReasonName(uint8_t v, char* out, size_t cap);
+size_t batteryClimateStateName(uint8_t v, char* out, size_t cap);
 size_t plugLockSetupName(uint8_t v, char* out, size_t cap);
 size_t plugLockStateName(uint8_t v, char* out, size_t cap);
 size_t plugSupplyName(uint8_t v, char* out, size_t cap);

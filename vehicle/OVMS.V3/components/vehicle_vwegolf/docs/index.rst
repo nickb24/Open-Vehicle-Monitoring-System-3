@@ -98,16 +98,19 @@ Cabin Climate Control
 * Temperature setpoint is set in the car's infotainment system (e-Manager)
 * Climatise on battery power is force-enabled
 * OVMS may show the car as charging/plugged-in even if it is not charging/plugged-in
-* Front windscreen heating can be included in pre-conditioning with ``xvg charge profile set 0 frontwindow on``
-  (``off`` to disable). The setting is stored in the car and applies to every climate start until it is changed;
-  it can also be changed while climate is running. ``xvg charge profile list`` shows it as ``fw`` on profile 0.
-  The car's infotainment has no equivalent setting
-* The windscreen heating will not turn on unless the outside temperature is below 4 °C, even when the option is
-  enabled. This threshold is set in the HVAC module (08) adaptation
-  "IDE07303-Rem.start funct.:activ.temper. of windshield defrost.heat." (default 4 °C) and cannot be changed by OVMS
-* The metric ``xvg.v.env.heated_front_window`` shows whether windscreen heating is active as part of remote
-  pre-conditioning. It does not reflect the windscreen heater button on the dashboard
-* The windscreen heater uses additional energy, which reduces range when climatising on battery power
+* Climate control heats or cools the cabin only. Window heating is a separate remote function, as in the car's own
+  remote control: ``xvg windowheat on`` / ``off`` heats the windscreen and rear window, on its own or while
+  climate is running (not yet verified on the car)
+* Every climate start clears any window heating option stored in the car. The former
+  ``xvg charge profile set 0 frontwindow`` setting has been removed
+* With window heating included in a climate start, the windscreen only heated below 4 °C outside, as set in the
+  HVAC module (08) adaptation "IDE07303-Rem.start funct.:activ.temper. of windshield defrost.heat." (default 4 °C).
+  Whether this also applies to ``xvg windowheat`` is not yet known
+* ``xvg seatheat on`` / ``off`` ``[front|fl|fr]`` is an experimental remote seat heating command. The seat setting
+  stays stored in the car until ``xvg seatheat clear``. On right-hand-drive cars ``fl`` is the passenger seat
+* The metrics ``xvg.v.env.heated_front_window`` and ``xvg.v.env.heated_rear_window`` show whether window heating
+  is active as part of remote heating. They do not reflect the heater buttons on the dashboard
+* The window heaters use additional energy, which reduces range when running on battery power
 
 --------------
 Charge Control

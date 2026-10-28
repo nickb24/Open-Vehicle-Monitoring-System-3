@@ -45,9 +45,36 @@ static constexpr uint8_t kTimerCollectSecs = 15;
 // Command entry
 // ---------------------------------------------------------------------------
 
-bool VWeGolfBatteryControl::Climate(bool enable) { return Begin(BC_CLIMATE, enable, 0); }
+bool VWeGolfBatteryControl::RefuseBusy(const char* what, const char* channel) {
+    // One command at a time: profile 0 is a single shared scratchpad, so a second command would
+    // re-arm it under the first one's trigger. The OCU queues; we refuse and say so.
+    char msg[96];
+    snprintf(msg, sizeof(msg), "%s refused: a %s command is still running — try again shortly", what,
+             OpName());
+    ESP_LOGW(TAG, "%s", msg);
+    MyNotify.NotifyString("alert", channel, msg);
+    return false;
+}
+
+bool VWeGolfBatteryControl::Climate(bool enable) {
+    if (Busy()) return RefuseBusy("Climate", "xvg.climate");
+    return Begin(BC_CLIMATE, enable, 0);
+}
+
+bool VWeGolfBatteryControl::WindowHeat(bool enable) {
+    if (Busy()) return RefuseBusy("Window heating", "xvg.climate");
+    return Begin(BC_WINDOW_HEAT, enable, 0);
+}
+
+bool VWeGolfBatteryControl::SeatHeat(bool enable, uint8_t seats) {
+    seats &= bap::egolf::PO_SEAT_FRONT;  // the e-Golf has front seat heating only
+    if (seats == 0) return false;
+    if (Busy()) return RefuseBusy("Seat heating", "xvg.climate");
+    return Begin(BC_SEAT_HEAT, enable, seats);
+}
 
 bool VWeGolfBatteryControl::Charge(bool enable) {
+    if (Busy()) return RefuseBusy("Charge", "xvg.charge");
     // Charge STOP is op-specific: it works only with profile 0 armed to charge (0x01), which clears
     // the climate bits — so stopping charge while climate is running would disrupt climate. Block it
     // (stop climate first). Climate stop is unaffected and stays allowed.
@@ -65,6 +92,7 @@ bool VWeGolfBatteryControl::SetChargeCurrent(uint16_t amps) {
     // echoes the requested value but charges at 10 A), so snapping to the nearest valid step is what
     // the user actually gets. clampMaxCurrent also enforces the 0x20 hard cap (again capped in
     // SendArm) — a maxCurrent above 0x20 bricks the car's charging until a factory reset.
+    if (Busy()) return RefuseBusy("SetChargeCurrent", "xvg.charge");
     return Begin(BC_SET_CURRENT, /*enable=*/true, bap::egolf::clampMaxCurrent(amps));
 }
 
@@ -160,7 +188,24 @@ uint8_t VWeGolfBatteryControl::GetTimers(bap::egolf::Timer* out, uint8_t maxOut,
     return n;
 }
 
+const char* VWeGolfBatteryControl::OpName() const {
+    switch (m_op) {
+        case BC_CLIMATE:      return "Climate";
+        case BC_CHARGE:       return "Charge";
+        case BC_SET_CURRENT:  return "SetChargeCurrent";
+        case BC_LIST:         return "ListProfiles";
+        case BC_PROFILE_SET:  return "SetProfile";
+        case BC_TIMER_LIST:   return "ListTimers";
+        case BC_TIMER_SET:    return "SetTimer";
+        case BC_TIMER_ENABLE: return "TimerEnable";
+        case BC_WINDOW_HEAT:  return "WindowHeat";
+        case BC_SEAT_HEAT:    return "SeatHeat";
+    }
+    return "BatteryControl";
+}
+
 bool VWeGolfBatteryControl::Begin(BcOp op, bool enable, uint16_t param) {
+    m_op = op;  // first, so OpName() / isTriggerOp() below describe the new command
     if (op == BC_SET_CURRENT)
         ESP_LOGI(TAG, "BatteryControl SetChargeCurrent -> %u A", (unsigned)param);
     else if (op == BC_PROFILE_SET)
@@ -172,15 +217,17 @@ bool VWeGolfBatteryControl::Begin(BcOp op, bool enable, uint16_t param) {
         ESP_LOGI(TAG, "BatteryControl SetTimer slot %u", m_timer_slot);
     else if (op == BC_TIMER_ENABLE)
         ESP_LOGI(TAG, "BatteryControl %s timer %u", enable ? "Enable" : "Disable", m_timer_slot);
+    else if (op == BC_SEAT_HEAT)
+        ESP_LOGI(TAG, "BatteryControl SeatHeat %s (seats 0x%02x)", enable ? "ON" : "OFF", (unsigned)param);
+    else if (isTriggerOp())
+        ESP_LOGI(TAG, "BatteryControl %s %s", OpName(), enable ? "ON" : "OFF");
     else
-        ESP_LOGI(TAG, "BatteryControl %s %s", op == BC_CHARGE ? "Charge" : "Climate",
-                 enable ? "ON" : "OFF");
+        ESP_LOGI(TAG, "BatteryControl %s", OpName());  // BC_LIST
     // Non-colliding path (independent of the OCU 0x5A7 heartbeat): assert a spare-node NM wake
     // to bring up the comfort/EV cluster; the actual BAP command runs event-driven from
     // IncomingBapStatus as the BCU responds. The wake is held only as a short bridge in Ticker1
     // — once the BCU accepts the command it and the cluster sustain their own NM. No OCU
     // impersonation (which risks the OCU-collision DTCs U001100/U120100 seen on this car).
-    m_op            = op;
     m_param         = (uint8_t)param;
     m_enable        = enable;
     // Auto-apply: a SetChargeCurrent issued WHILE a charge is running must re-fire the start after
@@ -237,7 +284,8 @@ void VWeGolfBatteryControl::Ticker1(bool bus_alive) {
     // (IncomingBapStatus). Only if a reply never arrives (a dropped frame) is the current step
     // re-sent. This is NOT a blind per-tick resend — once confirmed it stops, and profile 0
     // is armed exactly once (re-arming mid-start resets the BCU and stretches the confirmation).
-    if (!m_confirmed && m_phase_secs >= VWEGOLF_BATCTRL_RETRY_SECS) {
+    const uint8_t retry_secs = m_phase == CP_ARM_WAIT ? VWEGOLF_BATCTRL_ARM_ECHO_SECS : VWEGOLF_BATCTRL_RETRY_SECS;
+    if (!m_confirmed && m_phase_secs >= retry_secs) {
         m_phase_secs = 0;
         switch (m_phase) {
             case CP_HANDSHAKE:
@@ -326,14 +374,7 @@ void VWeGolfBatteryControl::Ticker1(bool bus_alive) {
         // Terminal outcome (fires once): release the NM. Success needs no separate notification
         // (climate is reflected in ms_v_env_hvac, charge on 0x594); on failure it notifies with the
         // distinguished cause so a remote user knows what happened.
-        const char* what = m_op == BC_CHARGE       ? "Charge"
-                         : m_op == BC_SET_CURRENT  ? "SetChargeCurrent"
-                         : m_op == BC_LIST         ? "ListProfiles"
-                         : m_op == BC_PROFILE_SET  ? "SetProfile"
-                         : m_op == BC_TIMER_LIST   ? "ListTimers"
-                         : m_op == BC_TIMER_SET    ? "SetTimer"
-                         : m_op == BC_TIMER_ENABLE ? "TimerEnable"
-                                                   : "Climate";
+        const char* what = OpName();
         if (m_confirmed) {
             ESP_LOGI(TAG, "%s %s confirmed — releasing NM, cluster self-sustains", what,
                      (isCliOp() || m_op == BC_SET_CURRENT) ? "" : (m_enable ? "ON" : "OFF"));
@@ -354,7 +395,8 @@ void VWeGolfBatteryControl::Ticker1(bool bus_alive) {
                             : "no response from ECU (timeout)";
             snprintf(reason, sizeof(reason), "%s command failed: %s", what, cause);
             ESP_LOGE(TAG, "%s FAILED — releasing NM: %s", what, reason);
-            MyNotify.NotifyString("alert", m_op == BC_CLIMATE ? "xvg.climate" : "xvg.charge", reason);
+            const bool charge_op = m_op == BC_CHARGE || m_op == BC_SET_CURRENT;
+            MyNotify.NotifyString("alert", charge_op ? "xvg.charge" : "xvg.climate", reason);
         }
         m_phase = CP_IDLE;
     }
@@ -470,10 +512,10 @@ void VWeGolfBatteryControl::IncomingBapStatus(const CAN_frame_t* p_frame) {
     }
 
     if (opmode) {
-        // The "49 58" echo confirms a climate/charge START/STOP, OR a SetChargeCurrent auto-apply
+        // The "49 58" echo confirms a climate/charge/heat START/STOP, OR a SetChargeCurrent auto-apply
         // (which re-fired the start). A write-only SET_CURRENT has no trigger and confirms on its
         // write echo instead (array handler below). Match the flag to the request.
-        if ((m_op == BC_CLIMATE || m_op == BC_CHARGE || (m_op == BC_SET_CURRENT && m_apply)) &&
+        if ((isTriggerOp() || (m_op == BC_SET_CURRENT && m_apply)) &&
             m_phase == CP_CONFIRM && (el.body[0] != 0) == m_enable) {
             m_confirmed = true;
             m_phase = CP_DONE;
@@ -501,6 +543,7 @@ void VWeGolfBatteryControl::IncomingBapStatus(const CAN_frame_t* p_frame) {
         // null and crash the RX task on a single malformed/glitched comfort-bus frame. Nothing here
         // is actionable without at least the leading [asgId|txn] byte, so drop it.
         if (el.bodyLen < 1 || el.body == nullptr) return;
+        LogArmedProfile(el);  // log-only, any client id: does profile 0 hold what we armed?
         const uint8_t lead = el.body[0];
         if (((lead >> 4) & 0x07) != bap::egolf::kAsgIdOvms) return;
 
@@ -541,9 +584,9 @@ void VWeGolfBatteryControl::IncomingBapStatus(const CAN_frame_t* p_frame) {
                 }
                 return;
             }
-            // Climate/charge: the arm write is acked -> NOW fire the trigger, so it runs the settled,
-            // newly-armed op instead of racing the multi-frame write and running the STALE op.
-            if ((m_op == BC_CLIMATE || m_op == BC_CHARGE) && m_phase == CP_ARM_WAIT) {
+            // Climate/charge/heat: the arm write is acked -> NOW fire the trigger, so it runs the
+            // settled, newly-armed op instead of racing the multi-frame write and running the STALE op.
+            if (isTriggerOp() && m_phase == CP_ARM_WAIT) {
                 ESP_LOGI(TAG, "arm write acked (49 59 %02x) — triggering", lead);
                 SendTrigger(m_enable);
                 m_phase = CP_CONFIRM;
@@ -558,6 +601,13 @@ void VWeGolfBatteryControl::IncomingBapStatus(const CAN_frame_t* p_frame) {
             bap::egolf::Profile profs[kMaxProfiles];
             bap::egolf::ArrayResult ares;
             size_t n = bap::egolf::decodeProfileArray(el.body, el.bodyLen, profs, kMaxProfiles, &ares);
+            // Only full RA0 records are usable here: a compact (RA6) record has no temperature, name
+            // or other fields, so a list would show zeros and an RMW would write them back. Our GET
+            // asks for RA0, so this never drops anything in practice.
+            size_t full = 0;
+            for (size_t i = 0; i < n; i++)
+                if (!profs[i].compact) profs[full++] = profs[i];
+            n = full;
 
             // BC_LIST: read-only dump — capture ALL decoded profiles and finish. No arm, no trigger,
             // no profile write of any kind. This is the safe read path `xvg charge profile list` uses;
@@ -715,13 +765,18 @@ void VWeGolfBatteryControl::InitStatusMetrics() {
     m_ms_climate_mode        = MyMetrics.InitString("xvg.v.env.climate.mode", SM_STALE_MID, "none");
     m_ms_climate_heaters     = MyMetrics.InitString("xvg.v.env.climate.heaters", SM_STALE_MID, "none");
     m_ms_climate_raw         = MyMetrics.InitString("xvg.v.env.climate.raw", SM_STALE_MID, "");
-    // Windscreen heating actually running in a remote climate session (ClimateState heater bit 0x10).
+    // Windscreen / rear window heating actually running in a remote session (ClimateState heater bits
+    // 0x10 / 0x20).
     m_ms_front_window        = MyMetrics.InitBool("xvg.v.env.heated_front_window", SM_STALE_MID, false);
+    m_ms_rear_window         = MyMetrics.InitBool("xvg.v.env.heated_rear_window", SM_STALE_MID, false);
     m_ms_charge_mode         = MyMetrics.InitString("xvg.v.c.bcu.mode", SM_STALE_MID, "no data");
     m_ms_charge_state        = MyMetrics.InitString("xvg.v.c.bcu.state", SM_STALE_MID, "no data");
     m_ms_charge_raw          = MyMetrics.InitString("xvg.v.c.bcu.raw", SM_STALE_MID, "");
     // Remaining charge time by the minute (v.c.duration.full from 0x594 has 5-minute steps). -1 = none.
     m_ms_charge_remaining    = MyMetrics.InitInt("xvg.v.c.bcu.remaining", SM_STALE_MID, -1, Minutes);
+    // ChargeState byte 8: what started the charge, and HV battery conditioning (firmware names).
+    m_ms_charge_startreason  = MyMetrics.InitString("xvg.v.c.bcu.startreason", SM_STALE_MID, "no data");
+    m_ms_charge_batclimate   = MyMetrics.InitString("xvg.v.c.bcu.batteryclimate", SM_STALE_MID, "no data");
     m_ms_plug_state          = MyMetrics.InitString("xvg.v.c.plug.state", SM_STALE_MID, "no data");
     m_ms_plug_supply         = MyMetrics.InitString("xvg.v.c.plug.supply", SM_STALE_MID, "no data");
     m_ms_plug_lock           = MyMetrics.InitString("xvg.v.c.plug.lock", SM_STALE_MID, "no data");
@@ -764,7 +819,9 @@ void VWeGolfBatteryControl::HandleClimateState(const uint8_t* body, uint16_t len
     climateHeaterNames(cs.heaters, heaters, sizeof(heaters));
 
     const uint8_t prev = m_cs_state;
+    const uint8_t hprev = m_hs_state;
     m_cs_state = cs.state;
+    m_hs_state = cs.heaterState;
     m_cs_age = 0;
 
     m_ms_climate_state->SetValue(state);
@@ -773,14 +830,27 @@ void VWeGolfBatteryControl::HandleClimateState(const uint8_t* body, uint16_t len
     m_ms_climate_heaters->SetValue(heaters);
     m_ms_climate_raw->SetValue(hex);
     m_ms_front_window->SetValue((cs.heaters & CH_WINDOW_FRONT) != 0);
+    m_ms_rear_window->SetValue((cs.heaters & CH_WINDOW_REAR) != 0);
     StandardMetrics.ms_v_env_heating->SetValue((cs.mode & CM_HEATING) != 0);
     StandardMetrics.ms_v_env_cooling->SetValue((cs.mode & CM_COOLING) != 0);
     if (BapClimateAuthoritative())
         StandardMetrics.ms_v_env_hvac->SetValue(cs.state == CS_RUNNING);
 
-    if (changed)
-        ESP_LOGI(TAG, "ClimateState 0x12 (%s): %s | climate: %s | seat/window: %s | mode: %s | heaters: %s",
-                 kind, hex, state, hstate, mode, heaters);
+    if (changed) {
+        // Bytes 1-4 (firmware layout, unverified: byte 1 has read 0 even with climate running).
+        char temp[24];
+        if (cs.temperatureRaw == 0)
+            snprintf(temp, sizeof(temp), "-");
+        else if (cs.temperatureUnit == 0) {
+            const int deci = rawToDeciDegC(cs.temperatureRaw);
+            snprintf(temp, sizeof(temp), "%d.%dC", deci / 10, deci % 10);
+        } else
+            snprintf(temp, sizeof(temp), "raw %u unit %u", (unsigned)cs.temperatureRaw,
+                     (unsigned)cs.temperatureUnit);
+        ESP_LOGI(TAG, "ClimateState 0x12 (%s): %s | climate: %s | seat/window: %s | mode: %s | heaters: %s"
+                 " | temp: %s | time raw: %u",
+                 kind, hex, state, hstate, mode, heaters, temp, (unsigned)cs.climatingTimeRaw);
+    }
 
     // Say why climate stopped or never started: the reasons the head unit shows popups for, and the
     // rest of the abort values. "ignition on" and "car body open" are the normal end of a remote session
@@ -790,6 +860,16 @@ void VWeGolfBatteryControl::HandleClimateState(const uint8_t* body, uint16_t len
         cs.state != CS_ABORT_IGNITION_ON && cs.state != CS_ABORT_BODY_OPEN) {
         char msg[96];
         snprintf(msg, sizeof(msg), "Climate %s: %s", prev == CS_RUNNING ? "stopped" : "not started", state);
+        ESP_LOGW(TAG, "%s", msg);
+        MyNotify.NotifyString("alert", "xvg.climate", msg);
+    }
+    // Same for the BCU's separate seat / window heating state machine (low nibble of byte 5).
+    if (hprev != 0xFF && hprev != cs.heaterState && climateStateIsAbort(cs.heaterState) &&
+        !climateStateIsAbort(hprev) && cs.heaterState != CS_ABORT_IGNITION_ON &&
+        cs.heaterState != CS_ABORT_BODY_OPEN) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "Window/seat heating %s: %s",
+                 hprev == CS_RUNNING ? "stopped" : "not started", hstate);
         ESP_LOGW(TAG, "%s", msg);
         MyNotify.NotifyString("alert", "xvg.climate", msg);
     }
@@ -817,6 +897,13 @@ void VWeGolfBatteryControl::HandleChargeState(const uint8_t* body, uint16_t len,
     m_ms_charge_state->SetValue(state);
     m_ms_charge_raw->SetValue(hex);
     m_ms_charge_remaining->SetValue(chs.remainingMin == 0xFFFF ? -1 : (int)chs.remainingMin);
+    char reason[40] = "-", batclimate[40] = "-";
+    if (chs.has8) {
+        chargeStartReasonName(chs.startReason, reason, sizeof(reason));
+        batteryClimateStateName(chs.batteryClimateState, batclimate, sizeof(batclimate));
+        m_ms_charge_startreason->SetValue(reason);
+        m_ms_charge_batclimate->SetValue(batclimate);
+    }
 
     if (changed) {
         char soc[16], remaining[16];
@@ -824,8 +911,9 @@ void VWeGolfBatteryControl::HandleChargeState(const uint8_t* body, uint16_t len,
         else snprintf(soc, sizeof(soc), "unknown");
         if (chs.remainingMin != 0xFFFF) snprintf(remaining, sizeof(remaining), "%u min", (unsigned)chs.remainingMin);
         else snprintf(remaining, sizeof(remaining), "-");
-        ESP_LOGI(TAG, "ChargeState 0x11 (%s): %s | mode: %s | state: %s | soc: %s | remaining: %s",
-                 kind, hex, mode, state, soc, remaining);
+        ESP_LOGI(TAG, "ChargeState 0x11 (%s): %s | mode: %s | state: %s | soc: %s | remaining: %s"
+                 " | start: %s | battery climate: %s",
+                 kind, hex, mode, state, soc, remaining, reason, batclimate);
     }
 
     if (prev != 0xFF && prev != chs.state && chargeStateIsAbort(chs.state) && !chargeStateIsAbort(prev)) {
@@ -880,6 +968,7 @@ void VWeGolfBatteryControl::ClearStatus() {
     m_status_cleared = true;
     for (auto& s : m_status_seen) s.len = 0;  // log each property once at the next wake
     m_cs_state = 0xFF;                        // no climate notification for the first state at wake
+    m_hs_state = 0xFF;
     m_cs_age = 0xFF;
     if (m_ms_climate_state == nullptr) return;
     m_ms_climate_state->SetValue("no data");
@@ -887,6 +976,7 @@ void VWeGolfBatteryControl::ClearStatus() {
     m_ms_climate_mode->SetValue("none");
     m_ms_climate_heaters->SetValue("none");
     m_ms_front_window->SetValue(false);
+    m_ms_rear_window->SetValue(false);
     StandardMetrics.ms_v_env_heating->SetValue(false);
     StandardMetrics.ms_v_env_cooling->SetValue(false);
 }
@@ -903,6 +993,7 @@ void VWeGolfBatteryControl::UpdateTimerCache(const bap::Element& el) {
     if (el.func == bap::egolf::FUNC_TIMER_STATE) {
         if (el.bodyLen < 1 || el.body == nullptr) return;
         m_timer_mask = (uint8_t)(el.body[0] & 0x0F);
+        m_timer_expired = el.bodyLen >= 2 ? (uint8_t)(el.body[1] & 0x0F) : 0;
         m_timer_mask_seen = true;
     } else {
         uint8_t slot = bap::egolf::timerSlotForFunc(el.func);
@@ -1059,13 +1150,19 @@ bool VWeGolfBatteryControl::SendArm() {
     // climateWithoutExternalSupply "Climatise on battery power" bit is preserved except where a
     // command must own it, below). Re-encoding the car's own bytes means no other stored setting
     // can be clobbered.
-    //   BC_CLIMATE / BC_CHARGE: flip ONLY the operation byte so the immediate trigger runs a
-    //     KNOWN op — climate sets PO_CLIMATE + PO_ALLOW_BATTERY and clears PO_CHARGING; charge sets
-    //     PO_CHARGING + clears PO_CLIMATE and PO_ALLOW_BATTERY (deterministic charge).
+    //   BC_CLIMATE / BC_CHARGE / BC_WINDOW_HEAT / BC_SEAT_HEAT: set the operation bits so the
+    //     immediate trigger runs a KNOWN op, like the OCU's setOperation(charge, clima, whFront,
+    //     whRear): exactly one of cabin climate, window heating or charge is armed, and the window
+    //     heater bits (operation2) are cleared for everything but window heating. The OCU never sends
+    //     climate and window heating in one write; combined, the car treats the window bit as an
+    //     automatic sub-option and drops it above 4 °C. Seat bits are kept as stored (the OCU keeps
+    //     them too), except by BC_SEAT_HEAT, which owns them.
     //   BC_SET_CURRENT: change ONLY maxCurrent; op is left as-is (this is a settings edit, not a
     //     start) — no trigger follows.
     // Emits "29 59 <3x-txn> 00 00 01 <full RA0 record>" (asgId 3 = OVMS; recordAddr 0 = RA0;
     // startIndex 0 = pos 0; count 1) — the full-record read-modify-write the factory MIB does.
+    using namespace bap::egolf;
+    constexpr uint8_t kWindowBits = PO2_WINDOW_HEATER_FRONT | PO2_WINDOW_HEATER_REAR;
     bap::egolf::Profile p = m_profile0;
     switch (m_op) {
         case BC_CLIMATE:
@@ -1075,24 +1172,38 @@ bool VWeGolfBatteryControl::SendArm() {
             // is safe. We must re-assert it because a charge command clears it (see BC_CHARGE) and
             // that write is persistent — without re-setting it here, climate would no longer work on
             // battery power after any charge. Result: climate always arms op 0x06.
-            p.operation = (uint8_t)((p.operation | bap::egolf::PO_CLIMATE | bap::egolf::PO_ALLOW_BATTERY)
-                                    & ~bap::egolf::PO_CHARGING);
+            // Window heater bits cleared: cabin climate only (OCU setOperation(false, true, false, false)).
+            p.operation = (uint8_t)((p.operation | PO_CLIMATE | PO_ALLOW_BATTERY) & ~PO_CHARGING);
+            p.operation2 &= (uint8_t)~kWindowBits;
             break;
         case BC_CHARGE:
             // Charge: PURE charge — clear BOTH climate bits, PO_CLIMATE *and* the on-battery bit
             // PO_ALLOW_BATTERY. PO_ALLOW_BATTERY ("climatise without external supply") is a STANDALONE
             // climate trigger, not just a modifier: leaving it set made a charge start (op 0x05) run
             // climate-on-battery when charging couldn't (unplugged) — confirmed on-car.
-            p.operation = (uint8_t)((p.operation | bap::egolf::PO_CHARGING)
-                                    & ~(bap::egolf::PO_CLIMATE | bap::egolf::PO_ALLOW_BATTERY));
+            p.operation = (uint8_t)((p.operation | PO_CHARGING) & ~(PO_CLIMATE | PO_ALLOW_BATTERY));
+            p.operation2 &= (uint8_t)~kWindowBits;
             break;
         case BC_SET_CURRENT:
             p.maxCurrent = m_param;
             // Auto-apply (a charge is running): also set the op to charge so the re-fired start
             // re-applies CHARGE with the new current. Idle: op left unchanged (pure settings edit).
-            if (m_apply)
-                p.operation = (uint8_t)((p.operation | bap::egolf::PO_CHARGING)
-                                        & ~(bap::egolf::PO_CLIMATE | bap::egolf::PO_ALLOW_BATTERY));
+            if (m_apply) {
+                p.operation = (uint8_t)((p.operation | PO_CHARGING) & ~(PO_CLIMATE | PO_ALLOW_BATTERY));
+                p.operation2 &= (uint8_t)~kWindowBits;
+            }
+            break;
+        case BC_WINDOW_HEAT:
+            // Window heating only: the OCU's setOperation(false, false, true, true) = op 0x04 (on-battery
+            // allowed, no climate, no charge) + op2 front + rear. Seat bits stay as stored.
+            p.operation = (uint8_t)((p.operation | PO_ALLOW_BATTERY) & ~(PO_CHARGING | PO_CLIMATE));
+            p.operation2 |= kWindowBits;
+            break;
+        case BC_SEAT_HEAT:
+            // TEST: the window-heating pattern with the requested seat bits instead of the window bits.
+            p.operation = (uint8_t)(((p.operation & ~PO_SEAT_MASK) | (m_param & PO_SEAT_MASK) |
+                                     PO_ALLOW_BATTERY) & ~(PO_CHARGING | PO_CLIMATE));
+            p.operation2 &= (uint8_t)~kWindowBits;
             break;
         case BC_LIST:
         case BC_PROFILE_SET:
@@ -1111,15 +1222,17 @@ bool VWeGolfBatteryControl::SendArm() {
     // preserved verbatim from the read-back (which could be garbled or, in future, out of range).
     if (p.maxCurrent > bap::egolf::kMaxCurrentHardLimit)
         p.maxCurrent = bap::egolf::kMaxCurrentHardLimit;
+    m_armed_op  = p.operation;
+    m_armed_op2 = p.operation2;
     // Skip-write optimization: for climate/charge the arm usually re-writes the SAME op profile 0
     // already holds, so the ~5-frame RA0 write is a no-op — skip it and let the trigger run the
     // already-correct op. (SET_CURRENT always writes — applying the current IS the command, and it
     // confirms on the write echo. A write still happens if the hard cap changed maxCurrent, i.e. p differs.)
-    if (m_op != BC_SET_CURRENT &&
-        p.operation == m_profile0.operation && p.maxCurrent == m_profile0.maxCurrent) {
+    if (m_op != BC_SET_CURRENT && p.operation == m_profile0.operation &&
+        p.operation2 == m_profile0.operation2 && p.maxCurrent == m_profile0.maxCurrent) {
         m_arm_skipped = true;  // no write -> no "49 59 bx" echo coming -> caller triggers immediately
-        ESP_LOGI(TAG, "%s arm: profile 0 already op 0x%02x — no write needed",
-                 m_op == BC_CHARGE ? "Charge" : "Climate", p.operation);
+        ESP_LOGI(TAG, "%s arm: profile 0 already op 0x%02x op2 0x%02x — no write needed", OpName(),
+                 p.operation, p.operation2);
         return true;
     }
     m_arm_skipped = false;  // a write goes out -> caller waits for its "49 59 bx" echo before triggering
@@ -1135,10 +1248,35 @@ bool VWeGolfBatteryControl::SendArm() {
         ESP_LOGI(TAG, "SetChargeCurrent arm: profile 0 maxCurrent 0x%02x -> 0x%02x (%u frames)",
                  m_profile0.maxCurrent, p.maxCurrent, r.framesSent);
     else
-        ESP_LOGI(TAG, "%s arm: profile 0 op 0x%02x -> 0x%02x written (%u frames)",
-                 m_op == BC_CHARGE ? "Charge" : "Climate", m_profile0.operation, p.operation,
+        ESP_LOGI(TAG, "%s arm: profile 0 op 0x%02x -> 0x%02x, op2 0x%02x -> 0x%02x written (%u frames)",
+                 OpName(), m_profile0.operation, p.operation, m_profile0.operation2, p.operation2,
                  r.framesSent);
     return true;
+}
+
+void VWeGolfBatteryControl::LogArmedProfile(const bap::Element& el) {
+    // The arm write's own echo ("49 59 bx 00 00 01") is a bare ack without the record, so the OCU's
+    // check of the written bits can't run off it. Any record for pos 0 the BCU reports during the
+    // command (a full RA0 list, or a compact RA6 change notification) is compared here instead —
+    // logged only, so an unexpected format can never block a start.
+    if (!isTriggerOp() || (m_phase != CP_ARM_WAIT && m_phase != CP_CONFIRM)) return;
+    // A few records are enough to find pos 0 (always first in a full list) and keep the RX task's
+    // stack small; a longer array just decodes truncated.
+    bap::egolf::Profile profs[4];
+    size_t n = bap::egolf::decodeProfileArray(el.body, el.bodyLen, profs, 4);
+    for (size_t i = 0; i < n; i++) {
+        if (profs[i].position != 0) continue;
+        const bool match = profs[i].operation == m_armed_op && profs[i].operation2 == m_armed_op2;
+        if (match)
+            ESP_LOGI(TAG, "%s: BCU reports profile 0 op 0x%02x op2 0x%02x (%s, lead 0x%02x) — as armed",
+                     OpName(), profs[i].operation, profs[i].operation2,
+                     profs[i].compact ? "RA6" : "RA0", el.body[0]);
+        else
+            ESP_LOGW(TAG, "%s: BCU reports profile 0 op 0x%02x op2 0x%02x (%s, lead 0x%02x), armed "
+                     "op 0x%02x op2 0x%02x", OpName(), profs[i].operation, profs[i].operation2,
+                     profs[i].compact ? "RA6" : "RA0", el.body[0], m_armed_op, m_armed_op2);
+        return;
+    }
 }
 
 bool VWeGolfBatteryControl::SendTrigger(bool on) {
@@ -1152,8 +1290,7 @@ bool VWeGolfBatteryControl::SendTrigger(bool on) {
                  (int)r.status, r.framesSent, bap::expectedFrames(2));
         return false;
     }
-    ESP_LOGI(TAG, "%s %s BAP trigger sent to 0x%08x (%u frames)",
-             m_op == BC_CHARGE ? "Charge" : "Climate", on ? "START" : "STOP",
+    ESP_LOGI(TAG, "%s %s BAP trigger sent to 0x%08x (%u frames)", OpName(), on ? "START" : "STOP",
              (unsigned)bap::egolf::kCanIdCommand, r.framesSent);
     return true;
 }
@@ -1176,14 +1313,10 @@ bool VWeGolfBatteryControl::SendProfileSetWrite() {
         p.operation = (uint8_t)((p.operation & ~(bap::egolf::PO_CHARGING | bap::egolf::PO_CLIMATE)) |
                                 (e.operation & (bap::egolf::PO_CHARGING | bap::egolf::PO_CLIMATE)));
 
-    // Set/clear ONLY the front window heater bit of operation2; keep its other bits (RMW).
-    if (e.fields & ProfileEdit::F_FRONT_WINDOW) {
-        if (e.heatedFrontWindow) {
-            p.operation2 |= bap::egolf::PO2_WINDOW_HEATER_FRONT;
-        } else {
-            p.operation2 &= (uint8_t)~bap::egolf::PO2_WINDOW_HEATER_FRONT;
-        }
-    }
+    // Replace ONLY the four seat-heater bits of operation; keep every other bit (RMW).
+    if (e.fields & ProfileEdit::F_SEATS)
+        p.operation = (uint8_t)((p.operation & ~bap::egolf::PO_SEAT_MASK) |
+                                (e.seatHeaters & bap::egolf::PO_SEAT_MASK));
 
     // ⚠ HARD SAFETY CLAMP (see kMaxCurrentHardLimit): NEVER write a maxCurrent above 0x20 — a higher
     // value bricks the car's charging until a factory reset. Guards both an F_CURRENT value and a

@@ -40,6 +40,10 @@
 #define VWEGOLF_NM_WAKE_NODE       0x7D  // spare node id (verified unused in captures)
 #define VWEGOLF_BATCTRL_WAKE_SECS  20    // max seconds to sustain the NM-wake bridge
 #define VWEGOLF_BATCTRL_RETRY_SECS 2     // backstop: re-send a step only if its reply is lost this long
+// The arm write's ack (49 59 bx) took up to 1.35 s on-car (2026-10-27), and the 1 Hz backstop counts
+// whole ticks, so a 2 s wait can fire after only ~1 s and re-arm under a trigger already sent. Wait
+// longer for that one reply (effective 2-3 s).
+#define VWEGOLF_BATCTRL_ARM_ECHO_SECS 3
 // Lost-reply backstop toggle. 1 = re-send the current step if its reply is lost (robust: replies and
 // frames can be dropped on the comfort bus). 0 = single-shot (send each step once, never re-send),
 // which distinguishes a slow BCU from a bus-swallowed frame.
@@ -89,8 +93,17 @@ class VWeGolfBatteryControl {
 
     // Entry points — each arms the wake bridge and kicks the first wake, then returns immediately
     // (true = request accepted); the sequence runs event-driven as the BCU responds. Only ONE command
-    // runs at a time (see BcOp); on the car climate and charge can be active simultaneously.
-    bool Climate(bool enable);             // remote pre-heat / pre-cool  (on-car validated)
+    // runs at a time (see BcOp): a new one is refused (false, with a notification) while another is
+    // still in flight, like the OCU's work queue. On the car climate and charge can be active together.
+    bool Climate(bool enable);             // remote pre-heat / pre-cool  (on-car validated). Cabin only:
+                                           // the arm clears the window heater bits, as the OCU does.
+    // Window heating (front + rear), the OCU's separate StartWindowHeating sequence: profile 0 armed
+    // op 0x04 / op2 0x03 (no climate bit), then the same 29 58 trigger. OFF arms the same bits and
+    // stops, which should leave a running cabin climate alone. [FW, not yet on-car]
+    bool WindowHeat(bool enable);
+    // Seat heating, TEST: same sequence with the seat bits PO_SEAT_* (seats = PO_SEAT_FL / FR mask) and
+    // no window bits. The OCU never sets seat bits, so whether the BCU honours them is unknown.
+    bool SeatHeat(bool enable, uint8_t seats);
     bool Charge(bool enable);              // remote charge start / stop  (on-car validated on a 2020 e-Golf.
                                            // The immediate charge trigger has no factory reference — the
                                            // car's own UI only edits timers. Gated no-arm->no-trigger like
@@ -118,8 +131,8 @@ class VWeGolfBatteryControl {
     // One profile-field edit for SetProfile(): a bitmask of the fields to change plus their new values.
     // The RMW reads the whole record back and overwrites ONLY the flagged fields, so every unmodeled
     // byte and the name are preserved verbatim. Which fields apply is per-profile and enforced by the
-    // CLI (profile 0 = current/minSoC/temp; charge locations 1-3 = flags/current/targetSoC); this struct
-    // itself just carries whatever the caller flagged.
+    // CLI (profile 0 = current/minSoC/temp; charge locations 1-3 = flags/current/targetSoC; seats =
+    // `xvg seatheat clear` only); this struct itself just carries whatever the caller flagged.
     struct ProfileEdit {
         enum Field : uint8_t {
             F_CURRENT = 0x01,  // maxCurrent (amps; hard-clamped <= 0x20 on write)
@@ -127,7 +140,7 @@ class VWeGolfBatteryControl {
             F_TGTSOC  = 0x04,  // targetChargeLevel % (charge locations only)
             F_TEMP    = 0x08,  // temperatureRaw     (profile 0 "Optionen" only)
             F_OP      = 0x10,  // operation charge/climate bits (charge locations only)
-            F_FRONT_WINDOW = 0x20,  // operation2 front window heater bit (profile 0 "Optionen" only)
+            F_SEATS   = 0x20,  // operation seat-heater bits PO_SEAT_* (profile 0, `xvg seatheat clear`)
         };
         uint8_t fields = 0;               // OR of Field bits actually being written
         uint8_t maxCurrent = 0;
@@ -135,7 +148,7 @@ class VWeGolfBatteryControl {
         uint8_t targetChargeLevel = 0;
         uint8_t temperatureRaw = 0;
         uint8_t operation = 0;            // desired PO_CHARGING/PO_CLIMATE bits (with F_OP)
-        bool heatedFrontWindow = false;   // desired heated front window state (with F_FRONT_WINDOW)
+        uint8_t seatHeaters = 0;          // desired PO_SEAT_* bits (with F_SEATS); 0 = all seats off
     };
 
     // Write one or more fields of charge profile `pos` (0 = global "Optionen", 1.. = charge locations)
@@ -176,6 +189,8 @@ class VWeGolfBatteryControl {
     // Whether the TimerState enable mask was actually read this command. If false, enabledMask is the
     // reset default (0) and must NOT be shown as "all disabled" — the enable state is simply unknown.
     bool TimerMaskSeen() const { return m_timer_mask_seen; }
+    // TimerState byte 1 (expired-timer mask, bit i = timer i+1), as last cached with the enable mask.
+    uint8_t TimerExpiredMask() const { return m_timer_expired; }
 
     // Per-second tick, forwarded from OvmsVehicleVWeGolf::Ticker1. Holds the NM-wake bridge
     // and backstops lost replies. bus_alive = KCAN has had live traffic within the timeout.
@@ -210,11 +225,24 @@ class VWeGolfBatteryControl {
         BC_TIMER_LIST,    // read-only: collect the 4 departure timers + enable mask; NO write
         BC_TIMER_SET,     // write one timer record (29 5x on 0x17332501) + RMW-enable it; confirm on echo
         BC_TIMER_ENABLE,  // RMW the TimerState enable mask only (enable/disable a slot); confirm on echo
+        BC_WINDOW_HEAT,   // arm op 0x04 / op2 0x03 -> trigger start/stop; confirm 49 58 (no hvac)
+        BC_SEAT_HEAT,     // arm op 0x04 | seats (m_param) / op2 0 -> trigger start/stop; confirm 49 58
     };
 
     // Shared entry: reset command state, select the op, kick the wake. enable = on/off for
-    // climate/charge (ignored/true for set-current); param = clamped amps for BC_SET_CURRENT.
+    // climate/charge/heat (ignored/true for set-current); param = clamped amps for BC_SET_CURRENT, the
+    // PO_SEAT_* mask for BC_SEAT_HEAT.
     bool Begin(BcOp op, bool enable, uint16_t param);
+    // Name of the in-flight op, for log lines and notifications.
+    const char* OpName() const;
+    // A command is in flight (past CP_DONE it is only releasing the NM bridge, so a new one may start).
+    bool Busy() const { return m_phase != CP_IDLE && m_phase != CP_DONE; }
+    // Refuse a remote command (climate / charge / heat) while another is in flight: log + notify.
+    bool RefuseBusy(const char* what, const char* channel);
+    // Ops that arm profile 0 and fire the OperationMode trigger, confirmed by the 49 58 echo.
+    bool isTriggerOp() const {
+        return m_op == BC_CLIMATE || m_op == BC_CHARGE || m_op == BC_WINDOW_HEAT || m_op == BC_SEAT_HEAT;
+    }
 
     // Command progress. The BCU's replies advance it; Ticker1 only holds the wake + backstops.
     enum ClimatePhase : uint8_t {
@@ -233,7 +261,10 @@ class VWeGolfBatteryControl {
     bool TxFrame(const uint8_t* frame, uint8_t dlc);  // one BAP frame -> BCU command id (0x17332501)
     bool SendHandshake();   // channel-open GETs "19 42" + "19 41"
     bool SendProfileGet();  // GET ProfilesArray "19 59" (reply drives the arm)
-    bool SendArm();         // RA0 read-modify-write: arm the global profile 0 for climate
+    bool SendArm();         // RA0 read-modify-write: arm the global profile 0 for the in-flight op
+    // Log-only check of a pos-0 record (RA0 / RA6) the BCU reports while a trigger op is in flight,
+    // against what SendArm() wrote. Never gates the trigger: the arm echo itself carries no record.
+    void LogArmedProfile(const bap::Element& el);
     bool SendTrigger(bool on);  // OperationMode immediate "29 58 00 <flag>"
     bool SendProfileSetWrite();  // BC_PROFILE_SET: apply m_prof_edit onto m_prof_base and write it back
 
@@ -317,6 +348,7 @@ class VWeGolfBatteryControl {
     bool     m_timer_seen[kNumTimers]  = {};        // slot i has broadcast a record at least once
     uint8_t  m_timer_mask       = 0;                // cached TimerState enable mask (bits 0..3)
     bool     m_timer_mask_seen  = false;            // the enable mask has been cached at least once
+    uint8_t  m_timer_expired    = 0;                // cached TimerState byte 1 (expired-timer mask)
     uint8_t  m_timer_slot       = 0;                // SET/ENABLE target slot (1..4)
     bap::egolf::Timer m_timer_write;                // SET: the record to write
     bool     m_timer_write_record = false;          // SET writes a record; ENABLE does not
@@ -336,6 +368,7 @@ class VWeGolfBatteryControl {
     struct StatusSeen { uint8_t raw[12]; uint8_t len; };
     StatusSeen m_status_seen[3]   = {};
     uint8_t  m_cs_state           = 0xFF;  // last climateState
+    uint8_t  m_hs_state           = 0xFF;  // last seatheaterWindowState (resets on sleep like m_cs_state)
     uint8_t  m_cs_age             = 0xFF;  // seconds since the last ClimateState (saturates at 255)
     uint8_t  m_chs_state          = 0xFF;  // last chargeState
     uint8_t  m_plug_lock_state    = 0xFF;  // last plug lockState
@@ -347,10 +380,13 @@ class VWeGolfBatteryControl {
     OvmsMetricString* m_ms_climate_heaters     = nullptr;  // xvg.v.env.climate.heaters
     OvmsMetricString* m_ms_climate_raw         = nullptr;  // xvg.v.env.climate.raw
     OvmsMetricBool*   m_ms_front_window        = nullptr;  // xvg.v.env.heated_front_window
+    OvmsMetricBool*   m_ms_rear_window         = nullptr;  // xvg.v.env.heated_rear_window
     OvmsMetricString* m_ms_charge_mode         = nullptr;  // xvg.v.c.bcu.mode
     OvmsMetricString* m_ms_charge_state        = nullptr;  // xvg.v.c.bcu.state
     OvmsMetricString* m_ms_charge_raw          = nullptr;  // xvg.v.c.bcu.raw
     OvmsMetricInt*    m_ms_charge_remaining    = nullptr;  // xvg.v.c.bcu.remaining (minutes, -1 = none)
+    OvmsMetricString* m_ms_charge_startreason  = nullptr;  // xvg.v.c.bcu.startreason
+    OvmsMetricString* m_ms_charge_batclimate   = nullptr;  // xvg.v.c.bcu.batteryclimate
     OvmsMetricString* m_ms_plug_state          = nullptr;  // xvg.v.c.plug.state
     OvmsMetricString* m_ms_plug_supply         = nullptr;  // xvg.v.c.plug.supply
     OvmsMetricString* m_ms_plug_lock           = nullptr;  // xvg.v.c.plug.lock
@@ -358,7 +394,9 @@ class VWeGolfBatteryControl {
 
     ClimatePhase m_phase       = CP_IDLE;
     BcOp    m_op            = BC_CLIMATE;  // which operation the in-flight command performs
-    uint8_t m_param         = 0;      // BC_SET_CURRENT: clamped charge-current limit (amps)
+    uint8_t m_param         = 0;      // BC_SET_CURRENT: clamped amps; BC_SEAT_HEAT: PO_SEAT_* mask
+    uint8_t m_armed_op      = 0;      // operation / operation2 profile 0 holds after SendArm() (written
+    uint8_t m_armed_op2     = 0;      // or already there), for LogArmedProfile()
     bool    m_enable        = false;  // requested on/off for the in-flight command
     bool    m_bcu_seen      = false;  // BCU (0x17332510) heard since this command's wake
     bool    m_have_profile0 = false;  // global profile 0 read back this command cycle (the arm gate)

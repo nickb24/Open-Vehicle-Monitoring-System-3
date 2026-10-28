@@ -1413,6 +1413,318 @@ void test_fcan_charging_fallback() {
     delete v;
 }
 
+// ---------------------------------------------------------------------------
+// OCU-style arming: climate / window heating / seat heating as separate sequences
+// ---------------------------------------------------------------------------
+
+// make_profile0_array with a chosen operation2 byte (record [1], body index 7).
+static std::vector<uint8_t> make_profile0_array_op2(uint8_t op, uint8_t op2) {
+    std::vector<uint8_t> b = make_profile0_array(op);
+    b[7] = op2;
+    return b;
+}
+
+// Run a trigger op from CP_PROFILE through the arm: inject profile 0 (op / op2), return the RA0
+// record written (empty if the arm write was skipped).
+static std::vector<uint8_t> arm_record(OvmsVehicleVWeGolf* v, uint8_t op, uint8_t op2) {
+    advance_to_profile_phase(v);
+    kcan(v)->tx_log.clear();
+    inject_bap_status(v, bap::egolf::FUNC_PROFILES_ARRAY, make_profile0_array_op2(op, op2));
+    auto arm = arm_write_body(kcan(v));
+    if (arm.size() < 4 + 20) return {};
+    return std::vector<uint8_t>(arm.begin() + 4, arm.end());
+}
+
+// Climate arms cabin climate only (OCU setOperation(false, true, false, false)): the window heater
+// bits are cleared, seat bits stay as stored.
+void test_climate_arm_clears_window_bits() {
+    printf("\ntest_climate_arm_clears_window_bits\n");
+    g_metrics = MetricStore{};
+    auto* v = new OvmsVehicleVWeGolf();
+
+    v->CommandClimateControl(true);
+    auto rec = arm_record(v, 0x31, 0x03);  // charge + FL seat; front + rear window stored
+    CHECK(rec.size() >= 20, "climate arm writes the RA0 record");
+    if (rec.size() >= 20) {
+        CHECK(rec[0] == 0x36, "op 0x31 -> 0x36: climate + on-battery, charge cleared, FL seat kept");
+        CHECK(rec[1] == 0x00, "op2 0x03 -> 0x00: window heater bits cleared");
+        CHECK(rec[12] == 0x78, "temperature preserved");
+    }
+    delete v;
+
+    // Same op but window bits stored: the arm must still write (skip-write compares op2 too).
+    g_metrics = MetricStore{};
+    v = new OvmsVehicleVWeGolf();
+    v->CommandClimateControl(true);
+    rec = arm_record(v, 0x06, 0x01);
+    CHECK(rec.size() >= 20 && rec[1] == 0x00, "op already 0x06 but op2 0x01 -> write op2 0x00 (no skip)");
+    CHECK(!sent_trigger(kcan(v)), "trigger waits for the arm echo");
+    delete v;
+
+    // Op and op2 already right: skip the write, trigger at once.
+    g_metrics = MetricStore{};
+    v = new OvmsVehicleVWeGolf();
+    v->CommandClimateControl(true);
+    rec = arm_record(v, 0x06, 0x00);
+    CHECK(rec.empty(), "op 0x06 / op2 0x00 already armed -> write skipped");
+    CHECK(sent_trigger(kcan(v)), "skipped arm triggers immediately");
+    delete v;
+
+    // Charge clears the window bits too.
+    g_metrics = MetricStore{};
+    v = new OvmsVehicleVWeGolf();
+    v->CommandStartCharge();
+    rec = arm_record(v, 0x06, 0x03);
+    CHECK(rec.size() >= 20 && rec[0] == 0x01 && rec[1] == 0x00, "charge arm: op 0x01, op2 cleared");
+    delete v;
+}
+
+// Window heating = the OCU's StartWindowHeating: op 0x04 (no climate, no charge) + op2 front + rear,
+// then the same trigger; confirmed by 49 58 without touching v.e.hvac.
+void test_window_heat_sequence() {
+    printf("\ntest_window_heat_sequence\n");
+    g_metrics = MetricStore{};
+    MyNotify = OvmsNotify{};
+    auto* v = new OvmsVehicleVWeGolf();
+
+    CHECK(v->test_batctrl().WindowHeat(true), "WindowHeat(true) accepted");
+    auto rec = arm_record(v, 0x06, 0x00);  // after a climate start
+    CHECK(rec.size() >= 20, "window heat arm writes the RA0 record");
+    if (rec.size() >= 20) {
+        CHECK(rec[0] == 0x04, "op 0x06 -> 0x04: on-battery only, climate cleared");
+        CHECK(rec[1] == 0x03, "op2 0x00 -> 0x03: front + rear window");
+        CHECK(rec[2] == 0x20 && rec[12] == 0x78 && memcmp(rec.data() + 20, "Optionen", 8) == 0,
+              "current, temperature and name preserved");
+    }
+    CHECK(!sent_trigger(kcan(v)), "no trigger before the arm echo");
+    inject_arm_echo(v);
+    CHECK(sent_trigger(kcan(v)), "arm echo releases '29 58 00 01'");
+    auto echo = make_kcan_frame(v, BAP_STS_ID, {0x49, 0x58, 0x01});
+    v->IncomingFrameCan3(&echo);
+    CHECK(!hvac_on(), "window heating confirm leaves v.e.hvac alone");
+    for (int i = 0; i <= VWEGOLF_BATCTRL_WAKE_SECS + 1; i++) call_ticker1(v, i);
+    CHECK(MyNotify.count == 0, "confirmed window heating releases with no notification");
+    delete v;
+
+    // Seat bits stay as stored (the OCU keeps them); OFF arms the same bits, then stops.
+    g_metrics = MetricStore{};
+    v = new OvmsVehicleVWeGolf();
+    CHECK(v->test_batctrl().WindowHeat(false), "WindowHeat(false) accepted");
+    rec = arm_record(v, 0x16, 0x00);
+    CHECK(rec.size() >= 20 && rec[0] == 0x14 && rec[1] == 0x03, "OFF: op 0x16 -> 0x14 (FL seat kept), op2 0x03");
+    inject_arm_echo(v);
+    bool stop = false;
+    for (auto& f : ext_frames(kcan(v), BAP_CMD_ID))
+        if (f.len == 4 && f.data[0] == 0x29 && f.data[1] == 0x58 && f.data[3] == 0x00) stop = true;
+    CHECK(stop, "OFF sends '29 58 00 00'");
+    delete v;
+}
+
+// Seat heating (test): window-heating pattern with the seat bits; no window bits.
+void test_seat_heat_sequence() {
+    printf("\ntest_seat_heat_sequence\n");
+    g_metrics = MetricStore{};
+    auto* v = new OvmsVehicleVWeGolf();
+
+    CHECK(v->test_batctrl().SeatHeat(true, bap::egolf::PO_SEAT_FRONT), "SeatHeat(front) accepted");
+    auto rec = arm_record(v, 0x86, 0x03);  // stray RR seat bit, windows stored
+    CHECK(rec.size() >= 20 && rec[0] == 0x34, "op 0x86 -> 0x34: FL + FR, on-battery, climate + RR cleared");
+    CHECK(rec.size() >= 20 && rec[1] == 0x00, "op2 window bits cleared");
+    inject_arm_echo(v);
+    CHECK(sent_trigger(kcan(v)), "seat heating triggers after the arm echo");
+    delete v;
+
+    g_metrics = MetricStore{};
+    v = new OvmsVehicleVWeGolf();
+    CHECK(v->test_batctrl().SeatHeat(true, bap::egolf::PO_SEAT_FR), "SeatHeat(fr) accepted");
+    rec = arm_record(v, 0x16, 0x00);
+    CHECK(rec.size() >= 20 && rec[0] == 0x24, "op 0x16 -> 0x24: FR only");
+    delete v;
+
+    g_metrics = MetricStore{};
+    v = new OvmsVehicleVWeGolf();
+    CHECK(!v->test_batctrl().SeatHeat(true, bap::egolf::PO_SEAT_RL), "rear seats refused (front only)");
+    delete v;
+
+    // `xvg seatheat clear`: profile-0 RMW that drops only the seat bits, no trigger.
+    g_metrics = MetricStore{};
+    v = new OvmsVehicleVWeGolf();
+    VWeGolfBatteryControl::ProfileEdit e;
+    e.fields = VWeGolfBatteryControl::ProfileEdit::F_SEATS;
+    e.seatHeaters = 0;
+    CHECK(v->test_batctrl().SetProfile(0, e), "SetProfile(0, seats 0) accepted");
+    rec = arm_record(v, 0x36, 0x01);
+    CHECK(rec.size() >= 20 && rec[0] == 0x06 && rec[1] == 0x01, "op 0x36 -> 0x06: seats cleared, rest kept");
+    CHECK(!sent_trigger(kcan(v)), "seat clear sends no trigger");
+    delete v;
+}
+
+// One command at a time: a remote command is refused while another is in flight, and allowed again
+// once the first is confirmed (CP_DONE, only releasing the NM bridge).
+void test_busy_guard() {
+    printf("\ntest_busy_guard\n");
+    g_metrics = MetricStore{};
+    MyNotify = OvmsNotify{};
+    auto* v = new OvmsVehicleVWeGolf();
+
+    CHECK(v->CommandClimateControl(true) == Success, "climate ON accepted");
+    advance_to_profile_phase(v);
+    CHECK(v->CommandClimateControl(false) == Fail, "climate OFF refused while ON is in flight");
+    CHECK(MyNotify.count == 1 && MyNotify.last_subtype == "xvg.climate" &&
+          MyNotify.last_value.find("refused") != std::string::npos, "refusal notifies on xvg.climate");
+    CHECK(v->CommandStartCharge() == Fail, "charge refused while climate is in flight");
+    CHECK(!v->test_batctrl().WindowHeat(true), "window heating refused while climate is in flight");
+
+    inject_bap_status(v, bap::egolf::FUNC_PROFILES_ARRAY, make_profile0_array(0x06));  // skip -> trigger
+    auto echo = make_kcan_frame(v, BAP_STS_ID, {0x49, 0x58, 0x01});
+    v->IncomingFrameCan3(&echo);  // confirmed -> CP_DONE
+    CHECK(v->test_batctrl().WindowHeat(true), "window heating accepted once climate is confirmed");
+    delete v;
+}
+
+// Number of arm-write telegrams (segmented "80 <len> 29 59" starts) on the command id.
+static int arm_writes(canbus* bus) {
+    int n = 0;
+    for (auto& f : ext_frames(bus, BAP_CMD_ID))
+        if (f.len >= 4 && f.data[0] == 0x80 && f.data[2] == 0x29 && f.data[3] == 0x59) n++;
+    return n;
+}
+
+// The arm ack took up to 1.35 s on-car; the backstop must not re-arm before ~2 s (ticks are whole
+// seconds, so the first one can land right after the write), but still re-arms if the ack is lost.
+void test_arm_echo_wait() {
+    printf("\ntest_arm_echo_wait\n");
+    g_metrics = MetricStore{};
+    auto* v = new OvmsVehicleVWeGolf();
+
+    v->CommandClimateControl(true);
+    advance_to_profile_phase(v);
+    kcan(v)->tx_log.clear();
+    inject_bap_status(v, bap::egolf::FUNC_PROFILES_ARRAY, make_profile0_array(0x01));  // write -> ARM_WAIT
+    CHECK(arm_writes(kcan(v)) == 1, "one arm write");
+    call_ticker1(v, 1);
+    call_ticker1(v, 2);
+    CHECK(arm_writes(kcan(v)) == 1, "no re-arm after 2 ticks (ack may take ~1.4 s)");
+    call_ticker1(v, 3);
+    CHECK(arm_writes(kcan(v)) == 2, "ack lost: re-arm after 3 ticks");
+    CHECK(!sent_trigger(kcan(v)), "still no trigger without the ack");
+    inject_arm_echo(v);
+    CHECK(sent_trigger(kcan(v)), "the ack releases the trigger");
+    delete v;
+}
+
+// The arm echo is a bare ack; a pos-0 record reported during the command is only logged, never gates
+// the trigger. Compact RA6 records decode, but are never used as the arm base.
+void test_ra6_and_echo_logging() {
+    printf("\ntest_ra6_and_echo_logging\n");
+    using namespace bap::egolf;
+
+    // RA6 record for pos 0 as another client would see it: lead 0x21 = client id 2 (OCU), flags 0x46 =
+    // PosTransmit + RA6, one element: pos 0, op 0x04, op2 0x03, 32 A, target 0.
+    const std::vector<uint8_t> ra6 = {0x21, 0x01, 0x46, 0x00, 0x01, 0x00, 0x04, 0x03, 0x20, 0x00};
+    Profile profs[2];
+    ArrayResult ares;
+    size_t n = decodeProfileArray(ra6.data(), (uint16_t)ra6.size(), profs, 2, &ares);
+    CHECK(n == 1 && ares.complete, "RA6 array decodes one record");
+    CHECK(n == 1 && profs[0].compact && profs[0].position == 0 && profs[0].operation == 0x04 &&
+          profs[0].operation2 == 0x03 && profs[0].maxCurrent == 0x20, "RA6 fields: op / op2 / current");
+
+    g_metrics = MetricStore{};
+    auto* v = new OvmsVehicleVWeGolf();
+    v->CommandClimateControl(true);
+    advance_to_profile_phase(v);
+    kcan(v)->tx_log.clear();
+    // An own-id RA6 reply in the read phase must not arm anything.
+    std::vector<uint8_t> ownRa6 = ra6;
+    ownRa6[0] = 0x31;
+    inject_bap_status(v, FUNC_PROFILES_ARRAY, ownRa6);
+    CHECK(arm_write_body(kcan(v)).empty() && !sent_trigger(kcan(v)), "compact record is never the arm base");
+    inject_bap_status(v, FUNC_PROFILES_ARRAY, make_profile0_array(0x01));
+    CHECK(!arm_write_body(kcan(v)).empty(), "the full RA0 record then arms");
+    // A record reported while waiting for the echo (OCU id, RA6) is logged only: still no trigger.
+    inject_bap_status(v, FUNC_PROFILES_ARRAY, ra6);
+    CHECK(!sent_trigger(kcan(v)), "a reported record does not release the trigger");
+    inject_arm_echo(v);
+    CHECK(sent_trigger(kcan(v)), "the arm echo does");
+    delete v;
+}
+
+// RA0 [7..11] re-modeled (u16 duration, u16 range, packed unit / setup): decode -> encode stays
+// byte-identical, so the read-modify-write is unaffected.
+void test_profile_widths_roundtrip() {
+    printf("\ntest_profile_widths_roundtrip\n");
+    using namespace bap::egolf;
+    std::vector<uint8_t> body = make_profile0_array(0x06);
+    body[6 + 7] = 0x34; body[6 + 8] = 0x12;   // duration 0x1234
+    body[6 + 9] = 0x78; body[6 + 10] = 0x56;  // range 0x5678
+    body[6 + 11] = 0x21;                      // unit 2, setup 1
+    Profile p[1];
+    CHECK(decodeProfileArray(body.data(), (uint16_t)body.size(), p, 1) == 1, "profile decodes");
+    CHECK(p[0].targetChargeDuration == 0x1234 && p[0].targetChargeRange == 0x5678 && p[0].unitRange == 2 &&
+          p[0].rangeCalculationSetup == 1, "duration u16 [7-8], range u16 [9-10], [11] nibbles");
+    uint8_t out[64];
+    size_t len = encodeProfile(out, sizeof(out), p[0]);
+    CHECK(len == body.size() - 6 && memcmp(out, body.data() + 6, len) == 0, "encode is byte-identical");
+}
+
+// ClimateState bytes 1-4 / heater state, ChargeState byte 8, timer byte 7 and TimerState byte 1.
+void test_status_extra_fields() {
+    printf("\ntest_status_extra_fields\n");
+    using namespace bap::egolf;
+    ClimateState cs;
+    const uint8_t cb[] = {0x11, 0x78, 0x00, 0x0a, 0x00, 0xbc, 0x30};
+    CHECK(decodeClimateState(cb, sizeof(cb), cs) && cs.temperatureRaw == 0x78 && cs.temperatureUnit == 0 &&
+          cs.climatingTimeRaw == 10 && cs.state == CS_IDLE && cs.heaterState == CS_RUNNING &&
+          cs.heaters == (CH_WINDOW_FRONT | CH_WINDOW_REAR), "ClimateState bytes 1-4 and both nibbles");
+
+    ChargeState chs;
+    const uint8_t charging[] = {0x12, 0x4a, 0xaf, 0x00, 0xff, 0xff, 0x00, 0xff, 0x11};
+    CHECK(decodeChargeState(charging, sizeof(charging), chs) && chs.has8 && chs.startReason == 1 &&
+          chs.batteryClimateState == 1, "ChargeState byte 8 0x11 = start reason 1 / battery climate 1");
+    const uint8_t shortCs[] = {0x12, 0x4a, 0xaf, 0x00};
+    CHECK(decodeChargeState(shortCs, sizeof(shortCs), chs) && !chs.has8, "no byte 8 -> has8 false");
+    char s[48];
+    chargeStartReasonName(1, s, sizeof(s));
+    CHECK(strcmp(s, "timer 1 (unconfirmed)") == 0, "start reason 1 = timer 1 (unconfirmed)");
+    batteryClimateStateName(1, s, sizeof(s));
+    CHECK(strcmp(s, "off (unconfirmed)") == 0, "battery climate 1 = off (unconfirmed)");
+
+    Timer t;
+    const uint8_t rec[8] = {0xff, 0xff, 0xff, 0x08, 0x1e, 0x3e, 0x01, 0x21};
+    CHECK(decodeTimer(rec, 8, t) && t.chargeSchedule == 2 && t.climateSchedule == 1, "timer byte 7 nibbles");
+    uint8_t enc[8];
+    encodeTimer(enc, sizeof(enc), t);
+    CHECK(enc[7] == 0x00, "timer writes still send byte 7 = 0x00");
+
+    g_metrics = MetricStore{};
+    MyNotify = OvmsNotify{};
+    auto* v = new OvmsVehicleVWeGolf();
+    inject_bap_status(v, FUNC_CHARGE_STATE, {0x12, 0x4a, 0xaf, 0x00, 0xff, 0xff, 0x00, 0xff, 0x11});
+    CHECK(str_metric("xvg.v.c.bcu.startreason") == "timer 1 (unconfirmed)" &&
+          str_metric("xvg.v.c.bcu.batteryclimate") == "off (unconfirmed)", "start reason / battery climate metrics");
+
+    inject_bap_status(v, FUNC_CLIMATE_STATE, std::vector<uint8_t>(cb, cb + sizeof(cb)));
+    CHECK(bool_metric("xvg.v.env.heated_front_window") && bool_metric("xvg.v.env.heated_rear_window"),
+          "heater bits 0x30 -> front + rear window metrics");
+    CHECK(!hvac_on(), "window heating with cabin climate idle: v.e.hvac off");
+    // Heater state running -> battery low notifies; -> ignition on does not.
+    inject_bap_status(v, FUNC_CLIMATE_STATE, {0x00, 0x00, 0x00, 0x0a, 0x00, 0xba, 0x00});
+    CHECK(MyNotify.count == 1 && MyNotify.last_subtype == "xvg.climate" &&
+          MyNotify.last_value == "Window/seat heating stopped: aborted: battery low (unconfirmed)",
+          "heater state running -> battery low notifies");
+    inject_bap_status(v, FUNC_CLIMATE_STATE, std::vector<uint8_t>(cb, cb + sizeof(cb)));
+    inject_bap_status(v, FUNC_CLIMATE_STATE, {0x00, 0x00, 0x00, 0x0a, 0x00, 0xb2, 0x00});
+    CHECK(MyNotify.count == 1, "heater state running -> ignition on: no notification");
+    CHECK(!bool_metric("xvg.v.env.heated_rear_window"), "rear window metric clears with the bit");
+
+    // TimerState byte 1 (expired mask) is cached with the enable mask.
+    inject_bap_status(v, FUNC_TIMER_STATE, {0x03, 0x01});
+    CHECK(v->test_batctrl().TimerExpiredMask() == 0x01, "TimerState 03 01 -> expired mask 0x1");
+    inject_bap_status(v, FUNC_TIMER_STATE, {0x03, 0x00});
+    CHECK(v->test_batctrl().TimerExpiredMask() == 0x00, "TimerState 03 00 -> expired mask 0");
+    delete v;
+}
+
 // SAFETY chokepoint: a profile-set write must hard-cap maxCurrent at 0x20 even when the read-back byte
 // is garbled above the limit and the edit does NOT touch current (a value >0x20 bricks charging).
 void test_set_profile_hard_caps_current() {
@@ -1710,6 +2022,15 @@ void test_bat_ctrl_all() {
     test_status_abort_notifications();
     test_status_from_getall_and_sleep();
     test_fcan_charging_fallback();
+    // OCU-style arming: climate / window heating / seat heating as separate sequences
+    test_climate_arm_clears_window_bits();
+    test_window_heat_sequence();
+    test_seat_heat_sequence();
+    test_busy_guard();
+    test_arm_echo_wait();
+    test_ra6_and_echo_logging();
+    test_profile_widths_roundtrip();
+    test_status_extra_fields();
     test_set_profile_hard_caps_current();
     test_set_profile_truncated_name_aborts();
     test_set_profile_guards();
