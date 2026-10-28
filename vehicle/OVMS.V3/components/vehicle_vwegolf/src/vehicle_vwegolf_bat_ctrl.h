@@ -118,8 +118,8 @@ class VWeGolfBatteryControl {
     // One profile-field edit for SetProfile(): a bitmask of the fields to change plus their new values.
     // The RMW reads the whole record back and overwrites ONLY the flagged fields, so every unmodeled
     // byte and the name are preserved verbatim. Which fields apply is per-profile and enforced by the
-    // CLI (profile 0 = current/minSoC/temp/heaters; charge locations 1-3 = flags/current/targetSoC); this
-    // struct itself just carries whatever the caller flagged.
+    // CLI (profile 0 = current/minSoC/temp; charge locations 1-3 = flags/current/targetSoC); this struct
+    // itself just carries whatever the caller flagged.
     struct ProfileEdit {
         enum Field : uint8_t {
             F_CURRENT = 0x01,  // maxCurrent (amps; hard-clamped <= 0x20 on write)
@@ -128,8 +128,6 @@ class VWeGolfBatteryControl {
             F_TEMP    = 0x08,  // temperatureRaw     (profile 0 "Optionen" only)
             F_OP      = 0x10,  // operation charge/climate bits (charge locations only)
             F_FRONT_WINDOW = 0x20,  // operation2 front window heater bit (profile 0 "Optionen" only)
-            F_SEATS   = 0x40,  // operation seat-heater bits PO_SEAT_* (profile 0 "Optionen" only)
-            F_REAR_WINDOW  = 0x80,  // operation2 rear window heater bit (profile 0 "Optionen" only)
         };
         uint8_t fields = 0;               // OR of Field bits actually being written
         uint8_t maxCurrent = 0;
@@ -138,8 +136,6 @@ class VWeGolfBatteryControl {
         uint8_t temperatureRaw = 0;
         uint8_t operation = 0;            // desired PO_CHARGING/PO_CLIMATE bits (with F_OP)
         bool heatedFrontWindow = false;   // desired heated front window state (with F_FRONT_WINDOW)
-        uint8_t seatHeaters = 0;          // desired PO_SEAT_* bits (with F_SEATS); 0 = all seats off
-        bool heatedRearWindow = false;    // desired heated rear window state (with F_REAR_WINDOW)
     };
 
     // Write one or more fields of charge profile `pos` (0 = global "Optionen", 1.. = charge locations)

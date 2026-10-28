@@ -383,16 +383,15 @@ void test_charge_state_no_spurious_stop() {
 }
 
 // ---------------------------------------------------------------------------
-// TEST BRANCH: 0x594 d[7] window heating REQUEST bits — front bit 7, rear bit 5 (log only)
+// 0x594 d[7] window heating REQUEST bits — front bit 7, rear bit 5 — do not drive any metric
 // ---------------------------------------------------------------------------
 void test_window_heat_0x594() {
     printf("\ntest_window_heat_0x594\n");
     auto* v = make_vehicle();
     const char* fw = "xvg.v.env.heated_front_window";
-    // Idle 0x594 with d[7] = setpoint 0x0D (22.0 C) | front 0x80 | rear 0x20. Each change is logged
-    // once ("0x594 window heating: ..."); the repeated frame is not. The bits are only the BCU's
-    // request (it drops the windscreen request when the car declines), so they no longer drive the
-    // heater metric — that comes from ClimateState 0x12 (see test_bat_ctrl).
+    // Idle 0x594 with d[7] = setpoint 0x0D (22.0 C) | front 0x80 | rear 0x20. The bits are only the
+    // BCU's request (it drops the windscreen request when the car declines), so they no longer drive
+    // the heater metric — that comes from ClimateState 0x12 (see test_bat_ctrl).
     auto frame = [](uint8_t d7) {
         return make_frame(0x594, {0x00, 0x00, 0x20, 0x03, 0x00, 0x00, 0x10, d7});
     };
