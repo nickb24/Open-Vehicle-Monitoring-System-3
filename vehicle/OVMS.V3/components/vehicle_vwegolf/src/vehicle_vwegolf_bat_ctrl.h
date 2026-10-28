@@ -97,10 +97,13 @@ class VWeGolfBatteryControl {
     // still in flight, like the OCU's work queue. On the car climate and charge can be active together.
     bool Climate(bool enable);             // remote pre-heat / pre-cool  (on-car validated). Cabin only:
                                            // the arm clears the window heater bits, as the OCU does.
-    // Window heating (front + rear), the OCU's separate StartWindowHeating sequence: profile 0 armed
-    // op 0x04 / op2 0x03 (no climate bit), then the same 29 58 trigger. OFF arms the same bits and
-    // stops, which should leave a running cabin climate alone. [FW, not yet on-car]
-    bool WindowHeat(bool enable);
+    // Window heating, the OCU's separate StartWindowHeating sequence: profile 0 armed op 0x04 / op2 =
+    // `windows` (PO2_WINDOW_HEATER_FRONT / _REAR mask, no climate bit), then the same 29 58 trigger.
+    // Both windows = the OCU's own arm [WIRE 2026-10-27: rear powered, windscreen dropped above 4 °C,
+    // runs alongside cabin climate]. One window = TEST: the OCU never arms just one, so whether the BCU
+    // starts only that heater, and whether OFF stops only that one (the BCU has a single seat/window
+    // heater state), is unknown.
+    bool WindowHeat(bool enable, uint8_t windows);
     // Seat heating, TEST: same sequence with the seat bits PO_SEAT_* (seats = PO_SEAT_FL / FR mask) and
     // no window bits. The OCU never sets seat bits, so whether the BCU honours them is unknown.
     bool SeatHeat(bool enable, uint8_t seats);
@@ -225,7 +228,7 @@ class VWeGolfBatteryControl {
         BC_TIMER_LIST,    // read-only: collect the 4 departure timers + enable mask; NO write
         BC_TIMER_SET,     // write one timer record (29 5x on 0x17332501) + RMW-enable it; confirm on echo
         BC_TIMER_ENABLE,  // RMW the TimerState enable mask only (enable/disable a slot); confirm on echo
-        BC_WINDOW_HEAT,   // arm op 0x04 / op2 0x03 -> trigger start/stop; confirm 49 58 (no hvac)
+        BC_WINDOW_HEAT,   // arm op 0x04 / op2 windows (m_param) -> trigger start/stop; confirm 49 58 (no hvac)
         BC_SEAT_HEAT,     // arm op 0x04 | seats (m_param) / op2 0 -> trigger start/stop; confirm 49 58
     };
 
@@ -404,6 +407,8 @@ class VWeGolfBatteryControl {
     bool    m_apply         = false;  // BC_SET_CURRENT while charging: re-fire the start after the write
                                       // so the RUNNING charge picks up the new current (else it ignores it)
     bool    m_confirmed     = false;  // BCU echoed "49 58 <flag>" matching the request
+    bool    m_processing    = false;  // BCU sent Processing "39 58" for our trigger (CP_CONFIRM)
+    bool    m_refused       = false;  // a START was processed and then reported failed (49 58 00)
     bool    m_error         = false;  // BCU returned a BAP ERROR response to the request
     bool    m_tx_fail       = false;  // a CAN write failed and the BCU was never heard
     uint8_t m_wake_hold     = 0;      // Ticker1 countdown for the NM-wake bridge (seconds)

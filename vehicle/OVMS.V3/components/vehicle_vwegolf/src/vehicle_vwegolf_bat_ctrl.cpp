@@ -61,9 +61,11 @@ bool VWeGolfBatteryControl::Climate(bool enable) {
     return Begin(BC_CLIMATE, enable, 0);
 }
 
-bool VWeGolfBatteryControl::WindowHeat(bool enable) {
+bool VWeGolfBatteryControl::WindowHeat(bool enable, uint8_t windows) {
+    windows &= bap::egolf::PO2_WINDOW_HEATER_FRONT | bap::egolf::PO2_WINDOW_HEATER_REAR;
+    if (windows == 0) return false;
     if (Busy()) return RefuseBusy("Window heating", "xvg.climate");
-    return Begin(BC_WINDOW_HEAT, enable, 0);
+    return Begin(BC_WINDOW_HEAT, enable, windows);
 }
 
 bool VWeGolfBatteryControl::SeatHeat(bool enable, uint8_t seats) {
@@ -219,6 +221,8 @@ bool VWeGolfBatteryControl::Begin(BcOp op, bool enable, uint16_t param) {
         ESP_LOGI(TAG, "BatteryControl %s timer %u", enable ? "Enable" : "Disable", m_timer_slot);
     else if (op == BC_SEAT_HEAT)
         ESP_LOGI(TAG, "BatteryControl SeatHeat %s (seats 0x%02x)", enable ? "ON" : "OFF", (unsigned)param);
+    else if (op == BC_WINDOW_HEAT)
+        ESP_LOGI(TAG, "BatteryControl WindowHeat %s (windows 0x%02x)", enable ? "ON" : "OFF", (unsigned)param);
     else if (isTriggerOp())
         ESP_LOGI(TAG, "BatteryControl %s %s", OpName(), enable ? "ON" : "OFF");
     else
@@ -235,6 +239,8 @@ bool VWeGolfBatteryControl::Begin(BcOp op, bool enable, uint16_t param) {
     // When no charge is running, stay write-only (don't kick off a charge from a settings change).
     m_apply         = (op == BC_SET_CURRENT) && StandardMetrics.ms_v_charge_inprogress->AsBool();
     m_confirmed     = false;
+    m_refused       = false;
+    m_processing    = false;
     m_error         = false;
     m_tx_fail       = false;
     m_have_profile0 = false;
@@ -388,7 +394,8 @@ void VWeGolfBatteryControl::Ticker1(bool bus_alive) {
             // Every command (ON, OFF, SET_CURRENT) reads profile 0 first to arm the matching op, so a
             // missing read is always a valid failure cause.
             const char* cause =
-                m_error     ? "rejected by the battery control unit"
+                m_refused   ? "not started by the car (it processed the start and reported it failed)"
+                : m_error   ? "rejected by the battery control unit"
                 : m_tx_fail ? "CAN transmit error (try 'can can3 reset')"
                 : !m_have_profile0
                             ? "could not read the vehicle's profile (no response)"
@@ -453,6 +460,11 @@ void VWeGolfBatteryControl::IncomingBapStatus(const CAN_frame_t* p_frame) {
             ESP_LOGI(TAG, "BatteryControl OperationMode 49 58 %02x", el.body[0]);
         }
     }
+    // "39 58" = the BCU's Processing indication for the OperationMode method: it has accepted the
+    // trigger and is working on it. Its Result (49 58) then tells success (01) or failure (00).
+    if (el.opcode == bap::OP_HEARTBEAT && el.func == bap::egolf::FUNC_OPERATION_MODE &&
+        m_phase == CP_CONFIRM)
+        m_processing = true;
 
     // First contact: the BCU's BAP layer is up. Send the channel-open handshake ONCE and then
     // WAIT for its ack before issuing any function GET. This ordering is essential: the BCU
@@ -515,11 +527,21 @@ void VWeGolfBatteryControl::IncomingBapStatus(const CAN_frame_t* p_frame) {
         // The "49 58" echo confirms a climate/charge/heat START/STOP, OR a SetChargeCurrent auto-apply
         // (which re-fired the start). A write-only SET_CURRENT has no trigger and confirms on its
         // write echo instead (array handler below). Match the flag to the request.
-        if ((isTriggerOp() || (m_op == BC_SET_CURRENT && m_apply)) &&
-            m_phase == CP_CONFIRM && (el.body[0] != 0) == m_enable) {
+        const bool started_op = isTriggerOp() || (m_op == BC_SET_CURRENT && m_apply);
+        if (started_op && m_phase == CP_CONFIRM && (el.body[0] != 0) == m_enable) {
             m_confirmed = true;
             m_phase = CP_DONE;
             if (m_wake_hold > 2) m_wake_hold = 2;  // release soon, small grace
+        } else if (started_op && m_phase == CP_CONFIRM && m_enable && el.body[0] == 0 && m_processing) {
+            // A START the BCU processed and then reported as failed (Processing 39 58, Result 49 58 00)
+            // — e.g. a front-window-only start, which the car cuts after 5 s [WIRE 2026-10-28]. Stop:
+            // re-firing the trigger would only repeat the attempt (each one pulsed the windscreen).
+            // Requires the Processing indication, so a stale "49 58 00" can't fail a good start.
+            m_refused = true;
+            m_phase = CP_DONE;
+            if (m_wake_hold > 1) m_wake_hold = 1;  // release + notify on the next tick
+            ESP_LOGW(TAG, "%s START not completed: the BCU processed it and answered 49 58 00 — not retrying",
+                     OpName());
         }
         return;
     }
@@ -1194,10 +1216,11 @@ bool VWeGolfBatteryControl::SendArm() {
             }
             break;
         case BC_WINDOW_HEAT:
-            // Window heating only: the OCU's setOperation(false, false, true, true) = op 0x04 (on-battery
-            // allowed, no climate, no charge) + op2 front + rear. Seat bits stay as stored.
+            // Window heating only: the OCU's setOperation(false, false, whFront, whRear) = op 0x04
+            // (on-battery allowed, no climate, no charge) + the requested window bits; both = the OCU's
+            // own arm, one = TEST. The window bits are replaced, other op2 bits and the seat bits kept.
             p.operation = (uint8_t)((p.operation | PO_ALLOW_BATTERY) & ~(PO_CHARGING | PO_CLIMATE));
-            p.operation2 |= kWindowBits;
+            p.operation2 = (uint8_t)((p.operation2 & ~kWindowBits) | (m_param & kWindowBits));
             break;
         case BC_SEAT_HEAT:
             // TEST: the window-heating pattern with the requested seat bits instead of the window bits.

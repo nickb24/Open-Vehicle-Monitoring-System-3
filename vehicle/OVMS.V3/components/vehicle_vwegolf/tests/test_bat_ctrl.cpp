@@ -1417,6 +1417,9 @@ void test_fcan_charging_fallback() {
 // OCU-style arming: climate / window heating / seat heating as separate sequences
 // ---------------------------------------------------------------------------
 
+static const uint8_t kBothWindows =
+    bap::egolf::PO2_WINDOW_HEATER_FRONT | bap::egolf::PO2_WINDOW_HEATER_REAR;
+
 // make_profile0_array with a chosen operation2 byte (record [1], body index 7).
 static std::vector<uint8_t> make_profile0_array_op2(uint8_t op, uint8_t op2) {
     std::vector<uint8_t> b = make_profile0_array(op);
@@ -1487,7 +1490,7 @@ void test_window_heat_sequence() {
     MyNotify = OvmsNotify{};
     auto* v = new OvmsVehicleVWeGolf();
 
-    CHECK(v->test_batctrl().WindowHeat(true), "WindowHeat(true) accepted");
+    CHECK(v->test_batctrl().WindowHeat(true, kBothWindows), "WindowHeat(true, both) accepted");
     auto rec = arm_record(v, 0x06, 0x00);  // after a climate start
     CHECK(rec.size() >= 20, "window heat arm writes the RA0 record");
     if (rec.size() >= 20) {
@@ -1509,7 +1512,7 @@ void test_window_heat_sequence() {
     // Seat bits stay as stored (the OCU keeps them); OFF arms the same bits, then stops.
     g_metrics = MetricStore{};
     v = new OvmsVehicleVWeGolf();
-    CHECK(v->test_batctrl().WindowHeat(false), "WindowHeat(false) accepted");
+    CHECK(v->test_batctrl().WindowHeat(false, kBothWindows), "WindowHeat(false, both) accepted");
     rec = arm_record(v, 0x16, 0x00);
     CHECK(rec.size() >= 20 && rec[0] == 0x14 && rec[1] == 0x03, "OFF: op 0x16 -> 0x14 (FL seat kept), op2 0x03");
     inject_arm_echo(v);
@@ -1517,6 +1520,95 @@ void test_window_heat_sequence() {
     for (auto& f : ext_frames(kcan(v), BAP_CMD_ID))
         if (f.len == 4 && f.data[0] == 0x29 && f.data[1] == 0x58 && f.data[3] == 0x00) stop = true;
     CHECK(stop, "OFF sends '29 58 00 00'");
+    delete v;
+}
+
+// Number of START triggers "29 58 00 01" sent on the command id.
+static int start_triggers(canbus* bus) {
+    int n = 0;
+    for (auto& f : ext_frames(bus, BAP_CMD_ID))
+        if (f.len == 4 && f.data[0] == 0x29 && f.data[1] == 0x58 && f.data[3] == 0x01) n++;
+    return n;
+}
+
+// A START the BCU processes and then reports failed (39 58 Processing, then 49 58 00 — the front-only
+// window heating of 2026-10-28) ends the command at once: no more triggers, one notification. Without
+// a Processing indication a "49 58 00" is not taken as a refusal; Processing then 01 confirms.
+void test_start_refused() {
+    printf("\ntest_start_refused\n");
+    g_metrics = MetricStore{};
+    MyNotify = OvmsNotify{};
+    auto* v = new OvmsVehicleVWeGolf();
+    auto processing = make_kcan_frame(v, BAP_STS_ID, {0x39, 0x58, 0x00});
+    auto result_off = make_kcan_frame(v, BAP_STS_ID, {0x49, 0x58, 0x00});
+    auto result_on  = make_kcan_frame(v, BAP_STS_ID, {0x49, 0x58, 0x01});
+
+    CHECK(v->test_batctrl().WindowHeat(true, bap::egolf::PO2_WINDOW_HEATER_FRONT), "front-only start accepted");
+    arm_record(v, 0x16, 0x00);
+    inject_arm_echo(v);
+    CHECK(start_triggers(kcan(v)) == 1, "one START trigger after the arm echo");
+    v->IncomingFrameCan3(&processing);
+    v->IncomingFrameCan3(&processing);
+    v->IncomingFrameCan3(&result_off);
+    for (int i = 0; i <= VWEGOLF_BATCTRL_WAKE_SECS + 1; i++) call_ticker1(v, i);
+    CHECK(start_triggers(kcan(v)) == 1, "processed + 49 58 00 -> no further START triggers");
+    CHECK(MyNotify.count == 1 && MyNotify.last_subtype == "xvg.climate" &&
+          MyNotify.last_value.find("not started by the car") != std::string::npos,
+          "one notification: not started by the car");
+    CHECK(v->test_batctrl().WindowHeat(true, kBothWindows), "the next command is accepted");
+    delete v;
+
+    // "49 58 00" without Processing (e.g. a stale echo): keep waiting / retrying as before.
+    g_metrics = MetricStore{};
+    MyNotify = OvmsNotify{};
+    v = new OvmsVehicleVWeGolf();
+    CHECK(v->test_batctrl().WindowHeat(true, kBothWindows), "both-window start accepted");
+    arm_record(v, 0x16, 0x00);
+    inject_arm_echo(v);
+    v->IncomingFrameCan3(&result_off);
+    call_ticker1(v, 1);
+    call_ticker1(v, 2);
+    CHECK(start_triggers(kcan(v)) == 2, "no Processing: a 49 58 00 does not end the command (trigger re-sent)");
+    v->IncomingFrameCan3(&processing);
+    v->IncomingFrameCan3(&result_on);
+    for (int i = 3; i <= VWEGOLF_BATCTRL_WAKE_SECS + 3; i++) call_ticker1(v, i);
+    CHECK(MyNotify.count == 0, "Processing then 49 58 01 confirms with no notification");
+    delete v;
+}
+
+// One window (TEST): the arm replaces only the window bits of op2 with the requested one; the other
+// op2 bits (park heater 0x04 / 0x08) stay as read.
+void test_window_heat_single() {
+    printf("\ntest_window_heat_single\n");
+    using namespace bap::egolf;
+    struct Case { uint8_t windows, op2In, op2Out; const char* what; };
+    const Case cases[] = {
+        {PO2_WINDOW_HEATER_REAR,  0x00, 0x02, "rear only: op2 0x00 -> 0x02"},
+        {PO2_WINDOW_HEATER_FRONT, 0x00, 0x01, "front only: op2 0x00 -> 0x01"},
+        {PO2_WINDOW_HEATER_REAR,  0x03, 0x02, "both stored -> rear: 0x03 -> 0x02 (replaced, not OR)"},
+        {PO2_WINDOW_HEATER_REAR,  0x0c, 0x0e, "park heater bits kept: 0x0c -> 0x0e"},
+    };
+    for (const Case& c : cases) {
+        g_metrics = MetricStore{};
+        auto* v = new OvmsVehicleVWeGolf();
+        CHECK(v->test_batctrl().WindowHeat(true, c.windows), "single-window WindowHeat accepted");
+        auto rec = arm_record(v, 0x16, c.op2In);
+        CHECK(rec.size() >= 20 && rec[0] == 0x14 && rec[1] == c.op2Out, c.what);
+        delete v;
+    }
+
+    // Already armed for the same window: no write, trigger at once.
+    g_metrics = MetricStore{};
+    auto* v = new OvmsVehicleVWeGolf();
+    CHECK(v->test_batctrl().WindowHeat(true, PO2_WINDOW_HEATER_REAR), "rear again accepted");
+    auto rec = arm_record(v, 0x14, 0x02);
+    CHECK(rec.empty() && sent_trigger(kcan(v)), "op 0x14 / op2 0x02 already armed -> skip write, trigger");
+    delete v;
+
+    g_metrics = MetricStore{};
+    v = new OvmsVehicleVWeGolf();
+    CHECK(!v->test_batctrl().WindowHeat(true, 0), "no window selected -> refused");
+    CHECK(!v->test_batctrl().WindowHeat(true, PO2_PARK_HEATER), "a non-window bit alone -> refused");
     delete v;
 }
 
@@ -1573,12 +1665,12 @@ void test_busy_guard() {
     CHECK(MyNotify.count == 1 && MyNotify.last_subtype == "xvg.climate" &&
           MyNotify.last_value.find("refused") != std::string::npos, "refusal notifies on xvg.climate");
     CHECK(v->CommandStartCharge() == Fail, "charge refused while climate is in flight");
-    CHECK(!v->test_batctrl().WindowHeat(true), "window heating refused while climate is in flight");
+    CHECK(!v->test_batctrl().WindowHeat(true, kBothWindows), "window heating refused while climate is in flight");
 
     inject_bap_status(v, bap::egolf::FUNC_PROFILES_ARRAY, make_profile0_array(0x06));  // skip -> trigger
     auto echo = make_kcan_frame(v, BAP_STS_ID, {0x49, 0x58, 0x01});
     v->IncomingFrameCan3(&echo);  // confirmed -> CP_DONE
-    CHECK(v->test_batctrl().WindowHeat(true), "window heating accepted once climate is confirmed");
+    CHECK(v->test_batctrl().WindowHeat(true, kBothWindows), "window heating accepted once climate is confirmed");
     delete v;
 }
 
@@ -2025,6 +2117,8 @@ void test_bat_ctrl_all() {
     // OCU-style arming: climate / window heating / seat heating as separate sequences
     test_climate_arm_clears_window_bits();
     test_window_heat_sequence();
+    test_window_heat_single();
+    test_start_refused();
     test_seat_heat_sequence();
     test_busy_guard();
     test_arm_echo_wait();

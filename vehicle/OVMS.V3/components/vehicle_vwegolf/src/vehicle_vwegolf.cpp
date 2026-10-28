@@ -78,16 +78,19 @@ OvmsVehicleVWeGolf::OvmsVehicleVWeGolf() {
 
     // Remote window / seat heating, separate from cabin climate (`climatecontrol on|off`), the way the
     // OCU runs them: each arms profile 0 for its own heaters and fires the same immediate trigger.
-    // TEST: window heating follows the OCU firmware; seat heating is an experiment.
-    OvmsCommand* cmd_wh = cmd_vweg->RegisterCommand("windowheat", "Remote window heating (front + rear)");
+    // TEST: window heating (both) follows the OCU firmware; front / rear alone and seat heating are
+    // experiments.
+    OvmsCommand* cmd_wh = cmd_vweg->RegisterCommand("windowheat", "Remote window heating");
     cmd_wh->RegisterCommand("on", "Start window heating",
-                            [this](int, OvmsWriter* writer, OvmsCommand*, int, const char* const*) {
-                                CommandWindowHeat(writer, true);
-                            });
+                            [this](int, OvmsWriter* writer, OvmsCommand*, int argc, const char* const* argv) {
+                                CommandWindowHeat(writer, true, argc, argv);
+                            },
+                            "[both|front|rear]", 0, 1);
     cmd_wh->RegisterCommand("off", "Stop window heating",
-                            [this](int, OvmsWriter* writer, OvmsCommand*, int, const char* const*) {
-                                CommandWindowHeat(writer, false);
-                            });
+                            [this](int, OvmsWriter* writer, OvmsCommand*, int argc, const char* const* argv) {
+                                CommandWindowHeat(writer, false, argc, argv);
+                            },
+                            "[both|front|rear]", 0, 1);
     OvmsCommand* cmd_sh = cmd_vweg->RegisterCommand("seatheat", "Remote seat heating (test)");
     cmd_sh->RegisterCommand("on", "Start seat heating",
                             [this](int, OvmsWriter* writer, OvmsCommand*, int argc, const char* const* argv) {
@@ -1459,15 +1462,28 @@ void OvmsVehicleVWeGolf::CommandSetProfile(OvmsWriter* writer, int argc, const c
 // Window / seat heating CLI (xvg windowheat / xvg seatheat)
 // ---------------------------------------------------------------------------
 
-void OvmsVehicleVWeGolf::CommandWindowHeat(OvmsWriter* writer, bool enable) {
+// Window argument: "both" (default) | "front" | "rear" -> PO2_WINDOW_HEATER_* bits, or 0 if unrecognized.
+static uint8_t vwe_parse_windows(int argc, const char* const* argv) {
+    const uint8_t front = bap::egolf::PO2_WINDOW_HEATER_FRONT, rear = bap::egolf::PO2_WINDOW_HEATER_REAR;
+    if (argc < 1 || vwe_ciequal(argv[0], "both")) return front | rear;
+    if (vwe_ciequal(argv[0], "front") || vwe_ciequal(argv[0], "windscreen")) return front;
+    if (vwe_ciequal(argv[0], "rear")) return rear;
+    return 0;
+}
+
+void OvmsVehicleVWeGolf::CommandWindowHeat(OvmsWriter* writer, bool enable, int argc, const char* const* argv) {
     // Fire-and-forget like climatecontrol: the result shows in the log, in
     // xvg.v.env.climate.heaterstate / heaters and xvg.v.env.heated_front_window / heated_rear_window,
     // and a failure notifies on xvg.climate.
-    if (!m_batctrl.WindowHeat(enable)) {
+    uint8_t windows = vwe_parse_windows(argc, argv);
+    if (windows == 0) { writer->puts("Windows: both | front | rear"); return; }
+    if (!m_batctrl.WindowHeat(enable, windows)) {
         writer->puts("Window heating refused — another command is in progress. Try again.");
         return;
     }
-    writer->printf("Window heating %s requested (waking vehicle).\n", enable ? "start" : "stop");
+    writer->printf("Window heating %s (%s) requested (waking vehicle).\n", enable ? "start" : "stop",
+                   windows == bap::egolf::PO2_WINDOW_HEATER_FRONT ? "front"
+                   : windows == bap::egolf::PO2_WINDOW_HEATER_REAR ? "rear" : "both");
 }
 
 // Seat argument: "front" (default) | "fl" | "fr" -> PO_SEAT_* bits, or 0 if unrecognized.

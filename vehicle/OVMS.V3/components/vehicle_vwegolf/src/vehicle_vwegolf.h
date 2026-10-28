@@ -153,9 +153,10 @@ class OvmsVehicleVWeGolf : public OvmsVehicle {
     // temp; charge locations 1-3 = flags/current/soc). Blocks (bounded) for the controller's result.
     void CommandSetProfile(OvmsWriter* writer, int argc, const char* const* argv);
 
-    // `xvg windowheat on|off` / `xvg seatheat on|off [front|fl|fr]`: fire-and-forget remote heating
-    // (like climatecontrol). `xvg seatheat clear`: profile-0 RMW dropping the stored seat bits (blocks).
-    void CommandWindowHeat(OvmsWriter* writer, bool enable);
+    // `xvg windowheat on|off [both|front|rear]` / `xvg seatheat on|off [front|fl|fr]`: fire-and-forget
+    // remote heating (like climatecontrol). `xvg seatheat clear`: profile-0 RMW dropping the stored seat
+    // bits (blocks).
+    void CommandWindowHeat(OvmsWriter* writer, bool enable, int argc, const char* const* argv);
     void CommandSeatHeat(OvmsWriter* writer, bool enable, int argc, const char* const* argv);
     void CommandSeatHeatClear(OvmsWriter* writer);
 

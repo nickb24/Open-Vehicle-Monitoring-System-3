@@ -100,7 +100,8 @@ Cabin Climate Control
 * OVMS may show the car as charging/plugged-in even if it is not charging/plugged-in
 * Climate control heats or cools the cabin only. Window heating is a separate remote function, as in the car's own
   remote control: ``xvg windowheat on`` / ``off`` heats the windscreen and rear window, on its own or while
-  climate is running (not yet verified on the car)
+  climate is running. ``xvg windowheat on|off front`` or ``rear`` switches one window only (experimental; the
+  car's own remote control always switches both)
 * Every climate start clears any window heating option stored in the car. The former
   ``xvg charge profile set 0 frontwindow`` setting has been removed
 * With window heating included in a climate start, the windscreen only heated below 4 °C outside, as set in the
