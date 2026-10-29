@@ -300,6 +300,9 @@ class VWeGolfBatteryControl {
     // Whether the BCU's ClimateState currently owns v.e.hvac (fresh, and describing a BCU climate
     // session rather than "ignition on" / "init"); otherwise the clima ECU's 0x5EA bit decides.
     bool BapClimateAuthoritative() const;
+    // A seat / window heating STOP with a fresh ClimateState whose heater state is not running: there is
+    // nothing to stop (the OCU finishes such a stop without arming or triggering).
+    bool HeaterAlreadyOff() const;
     // If BC_TIMER_LIST and the cache holds the mask + every slot, publish it (instant list). CP_PROFILE only.
     void TimerListMaybeComplete();
     // If BC_TIMER_SET/ENABLE and the enable mask is cached, RMW-write now (record + mask) and go to

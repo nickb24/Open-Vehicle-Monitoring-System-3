@@ -1627,6 +1627,47 @@ void test_processing_holds_retry() {
     delete v;
 }
 
+// A seat / window heating STOP while a fresh ClimateState says heating isn't running ends at once, with
+// no arm and no trigger (the OCU's check; such a stop left the BCU in Processing for 25 s on-car). With
+// heating running, or no ClimateState heard, the stop goes out as before.
+void test_heat_stop_when_idle() {
+    printf("\ntest_heat_stop_when_idle\n");
+    using namespace bap::egolf;
+    const std::vector<uint8_t> kHeatIdle    = {0x11, 0x00, 0x00, 0x0a, 0x00, 0xcb, 0x00};  // climate running
+    const std::vector<uint8_t> kHeatRunning = {0x11, 0x00, 0x00, 0x0a, 0x00, 0xcc, 0x20};  // + rear window
+    struct Case { bool seat; const std::vector<uint8_t>* cs; bool stopSent; const char* what; };
+    const Case cases[] = {
+        {true,  &kHeatIdle,    false, "seat OFF, heater idle -> no arm, no stop"},
+        {false, &kHeatIdle,    false, "window OFF, heater idle -> no arm, no stop"},
+        {false, &kHeatRunning, true,  "window OFF, heater running -> arm + stop"},
+        {true,  nullptr,       true,  "seat OFF, no ClimateState heard -> arm + stop"},
+    };
+    for (const Case& c : cases) {
+        g_metrics = MetricStore{};
+        MyNotify = OvmsNotify{};
+        auto* v = new OvmsVehicleVWeGolf();
+        bool ok = c.seat ? v->test_batctrl().SeatHeat(false, PO_SEAT_FL)
+                         : v->test_batctrl().WindowHeat(false, kBothWindows);
+        CHECK(ok, "stop accepted");
+        advance_to_profile_phase(v);
+        if (c.cs) inject_bap_status(v, FUNC_CLIMATE_STATE, *c.cs);  // the wake GetAll / a heartbeat
+        kcan(v)->tx_log.clear();
+        inject_bap_status(v, FUNC_PROFILES_ARRAY, make_profile0_array_op2(0x16, 0x00));
+        const int arms = arm_write_body(kcan(v)).empty() ? 0 : 1;
+        if (arms) inject_arm_echo(v);
+        int stops = 0;
+        for (auto& f : ext_frames(kcan(v), BAP_CMD_ID))
+            if (f.len == 4 && f.data[0] == 0x29 && f.data[1] == 0x58 && f.data[3] == 0x00) stops++;
+        CHECK((stops == 1 && arms == 1) == c.stopSent && (stops == 0 && arms == 0) == !c.stopSent, c.what);
+        if (!c.stopSent) {
+            for (int i = 0; i <= VWEGOLF_BATCTRL_WAKE_SECS + 1; i++) call_ticker1(v, i);
+            CHECK(MyNotify.count == 0, "nothing to stop: ends as done, no failure notification");
+            CHECK(v->test_batctrl().SeatHeat(true, PO_SEAT_FL), "the next command is accepted");
+        }
+        delete v;
+    }
+}
+
 // One window (TEST): the arm replaces only the window bits of op2 with the requested one; the other
 // op2 bits (park heater 0x04 / 0x08) stay as read.
 void test_window_heat_single() {
@@ -2200,6 +2241,7 @@ void test_bat_ctrl_all() {
     test_window_heat_single();
     test_start_refused();
     test_processing_holds_retry();
+    test_heat_stop_when_idle();
     test_seat_heat_sequence();
     test_busy_guard();
     test_arm_echo_wait();

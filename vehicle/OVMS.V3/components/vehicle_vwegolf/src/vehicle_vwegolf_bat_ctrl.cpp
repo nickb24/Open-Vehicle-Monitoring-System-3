@@ -714,6 +714,19 @@ void VWeGolfBatteryControl::IncomingBapStatus(const CAN_frame_t* p_frame) {
                     if (m_profile0.temperatureRaw != 0xFF)  // 0xFF = unset/padding
                         StandardMetrics.ms_v_env_cabinsetpoint->SetValue(
                             bap::egolf::rawToTemp(m_profile0.temperatureRaw), Celcius);
+                    // Seat / window heating STOP while the BCU reports that heating isn't running: done,
+                    // with no arm and no trigger. A stop for an idle heater left the BCU in Processing with
+                    // no Result for 25 s [WIRE 2026-10-28, seat1/seat2]; the OCU checks heaterState first
+                    // and finishes the same way. Needs a fresh ClimateState (the wake GetAll, which arrives
+                    // before this reply, carries one); without one the stop goes out as before.
+                    if (HeaterAlreadyOff()) {
+                        m_confirmed = true;
+                        m_phase = CP_DONE;
+                        if (m_wake_hold > 2) m_wake_hold = 2;
+                        ESP_LOGI(TAG, "%s OFF: seat/window heating is not running (heater state %u) — nothing to stop",
+                                 OpName(), (unsigned)m_hs_state);
+                        break;
+                    }
                     if (!SendArm()) break;  // arm TX failed; the CP_PROFILE backstop re-arms
                     if (m_op == BC_SET_CURRENT) {
                         // Idle: confirm on the write echo (0xbX), no trigger. Auto-apply (charging):
@@ -1016,6 +1029,11 @@ void VWeGolfBatteryControl::ClearStatus() {
 bool VWeGolfBatteryControl::BapClimateAuthoritative() const {
     return m_cs_state != 0xFF && m_cs_age <= kClimateFreshSecs &&
            m_cs_state != bap::egolf::CS_ABORT_IGNITION_ON && m_cs_state != bap::egolf::CS_INIT;
+}
+
+bool VWeGolfBatteryControl::HeaterAlreadyOff() const {
+    return (m_op == BC_WINDOW_HEAT || m_op == BC_SEAT_HEAT) && !m_enable &&
+           m_hs_state != 0xFF && m_cs_age <= kClimateFreshSecs && m_hs_state != bap::egolf::CS_RUNNING;
 }
 
 void VWeGolfBatteryControl::UpdateTimerCache(const bap::Element& el) {
