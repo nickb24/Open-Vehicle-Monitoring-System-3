@@ -1555,6 +1555,8 @@ void test_start_refused() {
     CHECK(MyNotify.count == 1 && MyNotify.last_subtype == "xvg.climate" &&
           MyNotify.last_value.find("not started by the car") != std::string::npos,
           "one notification: not started by the car");
+    CHECK(MyNotify.last_value == "WindowHeat command failed: not started by the car (it processed the start "
+                                 "and reported it failed)", "the notification is not truncated");
     CHECK(v->test_batctrl().WindowHeat(true, kBothWindows), "the next command is accepted");
     delete v;
 
@@ -1573,6 +1575,55 @@ void test_start_refused() {
     v->IncomingFrameCan3(&result_on);
     for (int i = 3; i <= VWEGOLF_BATCTRL_WAKE_SECS + 3; i++) call_ticker1(v, i);
     CHECK(MyNotify.count == 0, "Processing then 49 58 01 confirms with no notification");
+    delete v;
+}
+
+// The START trigger goes out once, as the OCU sends it: while the BCU reports Processing (39 58, every
+// 300 ms on-car) it is not re-sent; only when nothing is heard for the backstop time (a lost frame) is
+// it re-fired. A command that runs out of time while still Processing says so in its notification.
+void test_processing_holds_retry() {
+    printf("\ntest_processing_holds_retry\n");
+    g_metrics = MetricStore{};
+    MyNotify = OvmsNotify{};
+    auto* v = new OvmsVehicleVWeGolf();
+    auto processing = make_kcan_frame(v, BAP_STS_ID, {0x39, 0x58, 0x00});
+    auto result_on  = make_kcan_frame(v, BAP_STS_ID, {0x49, 0x58, 0x01});
+
+    CHECK(v->test_batctrl().WindowHeat(true, kBothWindows), "start accepted");
+    arm_record(v, 0x16, 0x00);
+    inject_arm_echo(v);
+    CHECK(start_triggers(kcan(v)) == 1, "one START trigger after the arm echo");
+    for (int i = 1; i <= 8; i++) {
+        v->IncomingFrameCan3(&processing);
+        call_ticker1(v, i);
+    }
+    CHECK(start_triggers(kcan(v)) == 1, "8 s of Processing -> still one START trigger");
+    call_ticker1(v, 9);
+    call_ticker1(v, 10);
+    CHECK(start_triggers(kcan(v)) == 2, "Processing stops for 2 s -> trigger re-sent (lost-reply backstop)");
+    v->IncomingFrameCan3(&processing);
+    v->IncomingFrameCan3(&result_on);
+    for (int i = 11; i <= VWEGOLF_BATCTRL_WAKE_SECS + 11; i++) call_ticker1(v, i);
+    CHECK(MyNotify.count == 0, "49 58 01 confirms with no notification");
+    delete v;
+
+    // Still Processing when the wake window ends: one trigger, and the notification says so.
+    g_metrics = MetricStore{};
+    MyNotify = OvmsNotify{};
+    v = new OvmsVehicleVWeGolf();
+    CHECK(v->test_batctrl().WindowHeat(false, kBothWindows), "stop accepted");
+    arm_record(v, 0x16, 0x03);
+    inject_arm_echo(v);
+    for (int i = 1; i <= VWEGOLF_BATCTRL_WAKE_SECS + 1; i++) {
+        v->IncomingFrameCan3(&processing);
+        call_ticker1(v, i);
+    }
+    int stops = 0;
+    for (auto& f : ext_frames(kcan(v), BAP_CMD_ID))
+        if (f.len == 4 && f.data[0] == 0x29 && f.data[1] == 0x58 && f.data[3] == 0x00) stops++;
+    CHECK(stops == 1, "STOP trigger sent once while Processing");
+    CHECK(MyNotify.count == 1 && MyNotify.last_value.find("still processing") != std::string::npos,
+          "timeout while Processing -> 'the car was still processing it'");
     delete v;
 }
 
@@ -1702,6 +1753,35 @@ void test_arm_echo_wait() {
     CHECK(!sent_trigger(kcan(v)), "still no trigger without the ack");
     inject_arm_echo(v);
     CHECK(sent_trigger(kcan(v)), "the ack releases the trigger");
+    delete v;
+}
+
+// Number of profile GetArray requests ("80 04 19 59 ..", first frame) sent on the command id.
+static int profile_gets(canbus* bus) {
+    int n = 0;
+    for (auto& f : ext_frames(bus, BAP_CMD_ID))
+        if (f.len >= 4 && f.data[0] == 0x80 && f.data[1] == 0x04 && f.data[2] == 0x19 && f.data[3] == 0x59) n++;
+    return n;
+}
+
+// The profile 0 read reply took 1.85 s on-car (2026-10-28) and the 2 s backstop re-sent the GET under
+// it; the read now waits 3 ticks like the arm ack, and a lost reply is still re-requested.
+void test_profile_read_wait() {
+    printf("\ntest_profile_read_wait\n");
+    g_metrics = MetricStore{};
+    auto* v = new OvmsVehicleVWeGolf();
+
+    v->CommandClimateControl(true);
+    advance_to_profile_phase(v);
+    CHECK(profile_gets(kcan(v)) == 1, "one profile GET after the handshake ack");
+    call_ticker1(v, 1);
+    call_ticker1(v, 2);
+    CHECK(profile_gets(kcan(v)) == 1, "no second GET after 2 ticks (reply may take ~1.9 s)");
+    call_ticker1(v, 3);
+    CHECK(profile_gets(kcan(v)) == 2, "reply lost: GET re-sent after 3 ticks");
+    kcan(v)->tx_log.clear();
+    inject_bap_status(v, bap::egolf::FUNC_PROFILES_ARRAY, make_profile0_array(0x01));
+    CHECK(arm_writes(kcan(v)) == 1, "the reply drives the arm");
     delete v;
 }
 
@@ -2119,9 +2199,11 @@ void test_bat_ctrl_all() {
     test_window_heat_sequence();
     test_window_heat_single();
     test_start_refused();
+    test_processing_holds_retry();
     test_seat_heat_sequence();
     test_busy_guard();
     test_arm_echo_wait();
+    test_profile_read_wait();
     test_ra6_and_echo_logging();
     test_profile_widths_roundtrip();
     test_status_extra_fields();

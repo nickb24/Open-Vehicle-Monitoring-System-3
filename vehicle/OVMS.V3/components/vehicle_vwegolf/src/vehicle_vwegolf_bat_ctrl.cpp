@@ -290,7 +290,9 @@ void VWeGolfBatteryControl::Ticker1(bool bus_alive) {
     // (IncomingBapStatus). Only if a reply never arrives (a dropped frame) is the current step
     // re-sent. This is NOT a blind per-tick resend — once confirmed it stops, and profile 0
     // is armed exactly once (re-arming mid-start resets the BCU and stretches the confirmation).
-    const uint8_t retry_secs = m_phase == CP_ARM_WAIT ? VWEGOLF_BATCTRL_ARM_ECHO_SECS : VWEGOLF_BATCTRL_RETRY_SECS;
+    // Profile-array replies (profile 0 read, arm ack) get longer; timer reads keep the short nudge.
+    const bool array_reply = m_phase == CP_ARM_WAIT || (m_phase == CP_PROFILE && !isTimerOp());
+    const uint8_t retry_secs = array_reply ? VWEGOLF_BATCTRL_ARRAY_REPLY_SECS : VWEGOLF_BATCTRL_RETRY_SECS;
     if (!m_confirmed && m_phase_secs >= retry_secs) {
         m_phase_secs = 0;
         switch (m_phase) {
@@ -339,7 +341,8 @@ void VWeGolfBatteryControl::Ticker1(bool bus_alive) {
                 // TimerState mask echo -> re-send the record (SET) + mask. Write-only SET_CURRENT is
                 // waiting on its write echo -> re-write. Everything else (climate/charge, or SET_CURRENT
                 // auto-apply past its re-trigger) is waiting on the 49 58 -> re-fire the trigger. Never
-                // re-arm a climate/charge start (that resets the BCU's spin-up).
+                // re-arm a climate/charge start (that resets the BCU's spin-up). A trigger the BCU
+                // answers with Processing (39 58) is not re-sent: each Processing restarts this backstop.
                 if (isTimerOp()) {
                     if (m_timer_write_record) SendTimerRecord();
                     SendTimerMask(m_timer_target_mask);
@@ -390,13 +393,14 @@ void VWeGolfBatteryControl::Ticker1(bool bus_alive) {
             m_list_state = LIST_FAILED;
             ESP_LOGW(TAG, "%s FAILED — releasing NM (no response / not confirmed)", what);
         } else {
-            char reason[96];
+            char reason[128];
             // Every command (ON, OFF, SET_CURRENT) reads profile 0 first to arm the matching op, so a
             // missing read is always a valid failure cause.
             const char* cause =
                 m_refused   ? "not started by the car (it processed the start and reported it failed)"
                 : m_error   ? "rejected by the battery control unit"
                 : m_tx_fail ? "CAN transmit error (try 'can can3 reset')"
+                : m_processing ? "the car was still processing it when OVMS stopped waiting"
                 : !m_have_profile0
                             ? "could not read the vehicle's profile (no response)"
                             : "no response from ECU (timeout)";
@@ -462,9 +466,15 @@ void VWeGolfBatteryControl::IncomingBapStatus(const CAN_frame_t* p_frame) {
     }
     // "39 58" = the BCU's Processing indication for the OperationMode method: it has accepted the
     // trigger and is working on it. Its Result (49 58) then tells success (01) or failure (00).
+    // Each Processing restarts the lost-reply backstop: the trigger arrived, so it is not re-sent
+    // while the BCU works on it. The OCU sends 29 58 exactly once and never re-sends it during
+    // Processing (baphandler bap_handle_immediately_control_stm); the BCU times its answer from the
+    // first trigger anyway (refusals at 10.0 s, successes at 4-5 s) [WIRE 2026-10-27/28].
     if (el.opcode == bap::OP_HEARTBEAT && el.func == bap::egolf::FUNC_OPERATION_MODE &&
-        m_phase == CP_CONFIRM)
+        m_phase == CP_CONFIRM) {
         m_processing = true;
+        m_phase_secs = 0;
+    }
 
     // First contact: the BCU's BAP layer is up. Send the channel-open handshake ONCE and then
     // WAIT for its ack before issuing any function GET. This ordering is essential: the BCU

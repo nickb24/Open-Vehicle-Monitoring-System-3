@@ -40,10 +40,11 @@
 #define VWEGOLF_NM_WAKE_NODE       0x7D  // spare node id (verified unused in captures)
 #define VWEGOLF_BATCTRL_WAKE_SECS  20    // max seconds to sustain the NM-wake bridge
 #define VWEGOLF_BATCTRL_RETRY_SECS 2     // backstop: re-send a step only if its reply is lost this long
-// The arm write's ack (49 59 bx) took up to 1.35 s on-car (2026-10-27), and the 1 Hz backstop counts
-// whole ticks, so a 2 s wait can fire after only ~1 s and re-arm under a trigger already sent. Wait
-// longer for that one reply (effective 2-3 s).
-#define VWEGOLF_BATCTRL_ARM_ECHO_SECS 3
+// The profile-array replies are slow: the arm write's ack (49 59 bx) took up to 1.35 s on-car
+// (2026-10-27), and the 119-byte profile 0 read reply (17 segments at ~50 ms, interleaved with other
+// BCU arrays) took 1.85 s (2026-10-28). The 1 Hz backstop counts whole ticks, so a 2 s wait can fire
+// after only ~1 s and re-send under a reply still arriving. Wait longer for these two (effective 2-3 s).
+#define VWEGOLF_BATCTRL_ARRAY_REPLY_SECS 3
 // Lost-reply backstop toggle. 1 = re-send the current step if its reply is lost (robust: replies and
 // frames can be dropped on the comfort bus). 0 = single-shot (send each step once, never re-send),
 // which distinguishes a slow BCU from a bus-swallowed frame.
