@@ -1,0 +1,21 @@
+{
+  "name": "vwegolf",
+  "title": "VW e-Golf: Climate & Heating",
+  "description": "Remote climate, window and seat heating controls plus a read-only vehicle status overview for the VW e-Golf (VWEG) vehicle module",
+  "group": "Vehicle",
+  "info": "http://www.openvehicles.com/",
+  "maintainer": "nickb24",
+  "version": "0.1",
+  "prerequisites": ["ovms>=3.3.001"],
+  "elements": [
+    {
+    "type": "webpage",
+    "name": "vwegolf-climate.htm",
+    "path": "vwegolf-climate.htm",
+    "page": "/plugins/vwegolf-climate",
+    "label": "Climate & Heating",
+    "menu": "Vehicle",
+    "auth": "Cookie"
+    }
+  ]
+}

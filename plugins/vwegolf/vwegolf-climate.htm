@@ -1,0 +1,468 @@
+<!--
+  VW e-Golf: Climate & Heating web plugin
+  Remote climate, window and seat heating controls plus a read-only vehicle status overview.
+
+  Requires the VWEG vehicle module with BatteryControl climate support (xvg windowheat / seatheat /
+  charge profile commands). Install as a web plugin page (see README.rst).
+
+  Status is read only from metrics the module already has: opening this page never wakes the car.
+  Every button runs a command; when the car is asleep (v.e.awake = no) the page asks first.
+-->
+<style>
+#xvgc .xvgc-tile { margin-bottom: 10px; }
+#xvgc .xvgc-tile .xvgc-lbl { font-size: 12px; text-transform: uppercase; letter-spacing: .5px; opacity: .75; }
+#xvgc .xvgc-tile .xvgc-val { font-size: 20px; font-weight: 600; }
+#xvgc .xvgc-big { font-size: 26px; font-weight: 600; line-height: 1.2; }
+#xvgc .xvgc-unit { font-size: 14px; font-weight: 400; opacity: .75; }
+#xvgc .xvgc-m { display: none; font-family: Menlo, Consolas, monospace; font-size: 11px; opacity: .8; }
+#xvgc.show-metrics .xvgc-m { display: block; }
+#xvgc .xvgc-btns { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+#xvgc .xvgc-btns .btn { min-height: 44px; min-width: 88px; }
+#xvgc .xvgc-pills .label { display: inline-block; font-size: 14px; padding: 8px 12px; margin: 0 6px 6px 0; }
+#xvgc .xvgc-panel { margin-bottom: 15px; }
+#xvgc .xvgc-panel .panel-body { min-height: 150px; }
+#xvgc .xvgc-slider { display: flex; align-items: center; gap: 12px; }
+#xvgc .xvgc-slider input[type=range] { flex: 1 1 auto; min-width: 0; height: 44px; }
+#xvgc .xvgc-slider output { font-size: 22px; font-weight: 600; min-width: 84px; text-align: right; }
+#xvgc .xvgc-range { display: flex; justify-content: space-between; font-size: 12px; opacity: .75; }
+#xvgc table.xvgc-status { margin-bottom: 0; }
+#xvgc table.xvgc-status td:last-child { text-align: right; font-weight: 600; }
+#xvgc #xvgc-outbox { margin: 0; padding: 0; border-radius: 4px; }
+#xvgc #xvgc-out { margin: 0; white-space: pre-wrap; min-height: 3em; }
+#xvgc #xvgc-outbox.alert-warning #xvgc-out { background: transparent; border-color: transparent; color: inherit; }
+#xvgc table.xvgc-debug td:first-child { font-family: Menlo, Consolas, monospace; word-break: break-all; width: 45%; }
+#xvgc table.xvgc-debug td:last-child { word-break: break-word; }
+</style>
+
+<div class="panel panel-primary" id="xvgc">
+  <div class="panel-heading">e-Golf Climate &amp; Heating</div>
+  <div class="panel-body receiver" id="xvgc-rx">
+
+    <!-- Readiness -->
+    <div class="row">
+      <div class="col-xs-6 col-sm-4 col-md-2 xvgc-tile"><div class="xvgc-lbl">SOC</div><div class="xvgc-val"><span data-x="soc">–</span> <span class="xvgc-unit">%</span></div><small class="xvgc-m">v.b.soc</small></div>
+      <div class="col-xs-6 col-sm-4 col-md-2 xvgc-tile"><div class="xvgc-lbl">12V battery</div><div class="xvgc-val"><span data-x="v12">–</span> <span class="xvgc-unit">V</span></div><small class="xvgc-m">v.b.12v.voltage</small></div>
+      <div class="col-xs-6 col-sm-4 col-md-2 xvgc-tile"><div class="xvgc-lbl">12V charging</div><div class="xvgc-val" data-x="chg12">–</div><small class="xvgc-m">v.e.charging12v</small></div>
+      <div class="col-xs-6 col-sm-4 col-md-2 xvgc-tile"><div class="xvgc-lbl">Plug</div><div class="xvgc-val" data-x="plug">–</div><small class="xvgc-m">xvg.v.c.plug.state</small></div>
+      <div class="col-xs-6 col-sm-4 col-md-2 xvgc-tile"><div class="xvgc-lbl">Parked</div><div class="xvgc-val" data-x="park">–</div><small class="xvgc-m">v.e.parktime</small></div>
+      <div class="col-xs-6 col-sm-4 col-md-2 xvgc-tile"><div class="xvgc-lbl">Car</div><div class="xvgc-val" data-x="awake">–</div><small class="xvgc-m">v.e.awake · v.e.on</small></div>
+    </div>
+
+    <div class="alert alert-info" id="xvgc-asleep" style="display:none">
+      Car asleep — climate and heater status shows “no data” until the car wakes. Any command asks before waking it.
+    </div>
+
+    <!-- Controls -->
+    <div class="row">
+      <div class="col-md-6">
+        <div class="panel panel-default xvgc-panel">
+          <div class="panel-heading">Climate <span class="label label-default pull-right" data-x="clbadge">–</span></div>
+          <div class="panel-body">
+            <div class="row">
+              <div class="col-xs-4"><small>Cabin</small><div class="xvgc-big"><span data-x="cabin">–</span><span class="xvgc-unit" data-xu="v.e.cabintemp">°C</span></div><small class="xvgc-m">v.e.cabintemp</small></div>
+              <div class="col-xs-4"><small>Target</small><div class="xvgc-big"><span data-x="setp">–</span><span class="xvgc-unit" data-xu="v.e.cabinsetpoint">°C</span></div><small class="xvgc-m">v.e.cabinsetpoint</small></div>
+              <div class="col-xs-4"><small>Outside</small><div class="xvgc-big"><span data-x="outside">–</span><span class="xvgc-unit" data-xu="v.e.temp">°C</span></div><small class="xvgc-m">v.e.temp</small></div>
+            </div>
+            <div style="margin-top:8px">
+              Mode: <strong data-x="clmode">–</strong> &nbsp;·&nbsp; State: <strong data-x="clstate">–</strong> &nbsp;·&nbsp; Battery: <strong><span data-x="bpower">–</span> kW</strong>
+              <small class="xvgc-m">xvg.v.env.climate.mode · xvg.v.env.climate.state · v.b.power</small>
+            </div>
+            <div class="xvgc-btns">
+              <button type="button" class="btn btn-primary xvgc-cmd" data-xcmd="climatecontrol on">Start climate</button>
+              <button type="button" class="btn btn-default xvgc-cmd" data-xcmd="climatecontrol off">Stop</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="col-md-6">
+        <div class="panel panel-default xvgc-panel">
+          <div class="panel-heading">Target temperature</div>
+          <div class="panel-body">
+            <div class="xvgc-slider">
+              <label for="xvgc-temp" style="margin:0;font-weight:400;white-space:nowrap">Set to</label>
+              <input type="range" id="xvgc-temp" min="15.5" max="30" step="0.5" value="21">
+              <output for="xvgc-temp" id="xvgc-temp-out">21.0 °C</output>
+            </div>
+            <div class="xvgc-range"><span>15.5 (Lo)</span><span>30.0 (Hi)</span></div>
+            <p class="help-block" style="margin-bottom:0">Stored in the car's charge profile 0, so the MIB shows the same value. Saving wakes the car.</p>
+            <small class="xvgc-m">xvg charge profile set 0 temp &lt;°C&gt;</small>
+            <div class="xvgc-btns" style="align-items:center">
+              <button type="button" class="btn btn-primary" id="xvgc-save" disabled>Save to car</button>
+              <span class="help-block" style="margin:0" id="xvgc-save-hint">Matches the car</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="col-md-6">
+        <div class="panel panel-default xvgc-panel">
+          <div class="panel-heading">Window heating</div>
+          <div class="panel-body">
+            <div class="xvgc-pills">
+              <span class="label label-default" data-x="wfront">Windscreen · –</span>
+              <span class="label label-default" data-x="wrear">Rear window · –</span>
+            </div>
+            <small class="xvgc-m">xvg.v.env.heated_front_window · xvg.v.env.heated_rear_window</small>
+            <div class="xvgc-btns">
+              <button type="button" class="btn btn-primary xvgc-cmd" data-xcmd="xvg windowheat on front">Front</button>
+              <button type="button" class="btn btn-primary xvgc-cmd" data-xcmd="xvg windowheat on rear">Rear</button>
+              <button type="button" class="btn btn-primary xvgc-cmd" data-xcmd="xvg windowheat on both">Both</button>
+              <button type="button" class="btn btn-default xvgc-cmd" data-xcmd="xvg windowheat off both">Stop</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="col-md-6">
+        <div class="panel panel-default xvgc-panel">
+          <div class="panel-heading">Seat heating</div>
+          <div class="panel-body">
+            <div class="xvgc-pills">
+              <span class="label label-default" data-x="sfl">Driver (FL) · –</span>
+              <span class="label label-default" data-x="sfr">Passenger (FR) · –</span>
+            </div>
+            <small class="xvgc-m">xvg.v.env.climate.heaters</small>
+            <div class="xvgc-btns">
+              <button type="button" class="btn btn-primary xvgc-cmd" data-xcmd="xvg seatheat on fl">Driver</button>
+              <button type="button" class="btn btn-primary xvgc-cmd" data-xcmd="xvg seatheat on fr">Passenger</button>
+              <button type="button" class="btn btn-primary xvgc-cmd" data-xcmd="xvg seatheat on front">Both</button>
+              <button type="button" class="btn btn-default xvgc-cmd" data-xcmd="xvg seatheat off front">Stop</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Vehicle status (read-only) -->
+    <h4>Vehicle status <small>read-only · last values the car reported · never wakes the car</small></h4>
+    <div class="row">
+      <div class="col-sm-6 col-lg-3">
+        <div class="panel panel-default xvgc-panel">
+          <div class="panel-heading">Vehicle</div>
+          <table class="table table-condensed xvgc-status"><tbody>
+            <tr><td>Locked<small class="xvgc-m">v.e.locked</small></td><td data-x="locked">–</td></tr>
+            <tr><td>Doors<small class="xvgc-m">v.d.fl · v.d.fr · v.d.rl · v.d.rr</small></td><td data-x="doors">–</td></tr>
+            <tr><td>Trunk / hood<small class="xvgc-m">v.d.trunk · v.d.hood</small></td><td data-x="trunkhood">–</td></tr>
+            <tr><td>Charge port<small class="xvgc-m">v.d.cp</small></td><td data-x="cp">–</td></tr>
+            <tr><td>Gear / drive mode<small class="xvgc-m">v.e.gear · v.e.drivemode</small></td><td data-x="gear">–</td></tr>
+            <tr><td>Odometer<small class="xvgc-m">v.p.odometer</small></td><td data-x="odo">–</td></tr>
+          </tbody></table>
+        </div>
+      </div>
+      <div class="col-sm-6 col-lg-3">
+        <div class="panel panel-default xvgc-panel">
+          <div class="panel-heading">HV battery</div>
+          <table class="table table-condensed xvgc-status"><tbody>
+            <tr><td>Temperature<small class="xvgc-m">v.b.temp</small></td><td data-x="btemp">–</td></tr>
+            <tr><td>Voltage<small class="xvgc-m">v.b.voltage</small></td><td data-x="bvolt">–</td></tr>
+            <tr><td>Current / power<small class="xvgc-m">v.b.current · v.b.power</small></td><td data-x="bcurpow">–</td></tr>
+            <tr><td>Range (est.)<small class="xvgc-m">v.b.range.est</small></td><td data-x="rest">–</td></tr>
+            <tr><td>Range (ideal)<small class="xvgc-m">v.b.range.ideal</small></td><td data-x="rideal">–</td></tr>
+            <tr><td>Capacity<small class="xvgc-m">v.b.capacity</small></td><td data-x="bcap">–</td></tr>
+          </tbody></table>
+        </div>
+      </div>
+      <div class="col-sm-6 col-lg-3">
+        <div class="panel panel-default xvgc-panel">
+          <div class="panel-heading">Charging</div>
+          <table class="table table-condensed xvgc-status"><tbody>
+            <tr><td>State<small class="xvgc-m">v.c.state · xvg.v.c.bcu.state</small></td><td data-x="cstate">–</td></tr>
+            <tr><td>Plug / lock<small class="xvgc-m">v.c.type · xvg.v.c.plug.lock</small></td><td data-x="cplug">–</td></tr>
+            <tr><td>Power / current<small class="xvgc-m">v.c.power · v.c.current</small></td><td data-x="cpow">–</td></tr>
+            <tr><td>Current limit<small class="xvgc-m">v.c.climit</small></td><td data-x="climit">–</td></tr>
+            <tr><td>Time to full<small class="xvgc-m">xvg.v.c.bcu.remaining</small></td><td data-x="cfull">–</td></tr>
+            <tr><td>Departure timer<small class="xvgc-m">v.c.timermode</small></td><td data-x="ctimer">–</td></tr>
+          </tbody></table>
+        </div>
+      </div>
+      <div class="col-sm-6 col-lg-3">
+        <div class="panel panel-default xvgc-panel">
+          <div class="panel-heading">Module</div>
+          <table class="table table-condensed xvgc-status"><tbody>
+            <tr><td>Network<small class="xvgc-m">m.net.provider</small></td><td data-x="net">–</td></tr>
+            <tr><td>Signal<small class="xvgc-m">m.net.sq</small></td><td data-x="sq">–</td></tr>
+            <tr><td>12V voltage<small class="xvgc-m">v.b.12v.voltage</small></td><td data-x="v12b">–</td></tr>
+            <tr><td>Bus<small class="xvgc-m">v.e.awake · v.e.on</small></td><td data-x="bus">–</td></tr>
+            <tr><td>VIN<small class="xvgc-m">v.vin</small></td><td data-x="vin" style="font-family:Menlo,Consolas,monospace">–</td></tr>
+          </tbody></table>
+        </div>
+      </div>
+    </div>
+
+    <!-- Last command -->
+    <div class="panel panel-default xvgc-panel">
+      <div class="panel-heading">Last command <span class="pull-right" id="xvgc-busy"></span></div>
+      <div class="panel-body">
+        <div id="xvgc-outbox"><pre id="xvgc-out">No command sent yet.</pre></div>
+      </div>
+    </div>
+
+    <!-- Debug -->
+    <div class="panel panel-default xvgc-panel">
+      <div class="panel-heading">
+        BCU details (debug)
+        <button type="button" class="btn btn-default btn-sm pull-right" data-toggle="collapse" data-target="#xvgc-debug" aria-expanded="false" aria-controls="xvgc-debug" style="margin-top:-5px">Show / hide</button>
+      </div>
+      <div class="collapse" id="xvgc-debug">
+        <div class="panel-body">
+          <div class="checkbox" style="margin-top:0">
+            <label><input type="checkbox" id="xvgc-showm"> Show metric names on this page</label>
+          </div>
+          <div class="table-responsive">
+            <table class="table table-condensed xvgc-debug" style="margin-bottom:0"><tbody>
+              <tr><td>xvg.v.env.climate.state</td><td data-r="xvg.v.env.climate.state"></td></tr>
+              <tr><td>xvg.v.env.climate.heaterstate</td><td data-r="xvg.v.env.climate.heaterstate"></td></tr>
+              <tr><td>xvg.v.env.climate.mode</td><td data-r="xvg.v.env.climate.mode"></td></tr>
+              <tr><td>xvg.v.env.climate.heaters</td><td data-r="xvg.v.env.climate.heaters"></td></tr>
+              <tr><td>xvg.v.env.climate.raw</td><td data-r="xvg.v.env.climate.raw"></td></tr>
+              <tr><td>xvg.v.c.bcu.mode</td><td data-r="xvg.v.c.bcu.mode"></td></tr>
+              <tr><td>xvg.v.c.bcu.state</td><td data-r="xvg.v.c.bcu.state"></td></tr>
+              <tr><td>xvg.v.c.bcu.startreason</td><td data-r="xvg.v.c.bcu.startreason"></td></tr>
+              <tr><td>xvg.v.c.bcu.batteryclimate</td><td data-r="xvg.v.c.bcu.batteryclimate"></td></tr>
+              <tr><td>xvg.v.c.bcu.raw</td><td data-r="xvg.v.c.bcu.raw"></td></tr>
+              <tr><td>xvg.v.c.plug.state</td><td data-r="xvg.v.c.plug.state"></td></tr>
+              <tr><td>xvg.v.c.plug.supply</td><td data-r="xvg.v.c.plug.supply"></td></tr>
+              <tr><td>xvg.v.c.plug.lock</td><td data-r="xvg.v.c.plug.lock"></td></tr>
+              <tr><td>xvg.v.c.plug.lockerror</td><td data-r="xvg.v.c.plug.lockerror"></td></tr>
+            </tbody></table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+(function(){
+  var $root = $("#xvgc"), $rx = $("#xvgc-rx");
+  var $out = $("#xvgc-out"), $outbox = $("#xvgc-outbox"), $busy = $("#xvgc-busy");
+  var $temp = $("#xvgc-temp"), $tempOut = $("#xvgc-temp-out"), $save = $("#xvgc-save"), $saveHint = $("#xvgc-save-hint");
+  var running = false;      // a command request from this page is in flight
+  var tempDirty = false;    // the user moved the slider since the last sync
+  var tempPending = null;   // value written to the car, until v.e.cabinsetpoint reports it
+
+  // ---- helpers ----
+  function m(name) { return metrics[name]; }
+  function has(name) { var v = metrics[name]; return v !== undefined && v !== null && v !== ""; }
+  function truthy(v) { return v === true || v === "true" || v === "yes" || v === 1 || v === "1"; }
+  function yesNo(name) { return has(name) ? (truthy(m(name)) ? "Yes" : "No") : "–"; }
+  function setx(key, text) { $rx.find('[data-x="' + key + '"]').text(text); }
+  // Number in the user's preferred unit (where the framework knows one), with fallback label.
+  function num(name, prec, fallbackUnit) {
+    if (!has(name)) return "–";
+    var v = Number(m(name));
+    if (isNaN(v)) return String(m(name));
+    var lbl = "";
+    if (typeof units !== "undefined" && units.userUnitLabelFromMetric) {
+      v = Number(units.convertMetricToUserUnits(v, name));
+      lbl = units.userUnitLabelFromMetric(name) || "";
+    }
+    var s = (prec != null) ? v.toFixed(prec) : String(v);
+    var u = lbl || fallbackUnit || "";
+    return u ? s + " " + u : s;
+  }
+  function bare(name, prec) {  // number only, user units, no label
+    if (!has(name)) return "–";
+    var v = Number(m(name));
+    if (isNaN(v)) return String(m(name));
+    if (typeof units !== "undefined" && units.convertMetricToUserUnits) v = Number(units.convertMetricToUserUnits(v, name));
+    return (prec != null) ? v.toFixed(prec) : String(v);
+  }
+  function str(name) { return has(name) ? String(m(name)) : "–"; }
+  function asleep() { return has("v.e.awake") ? !truthy(m("v.e.awake")) : false; }
+  function duration(secs) {
+    secs = Number(secs);
+    if (!(secs > 0)) return "–";
+    var mins = Math.floor(secs / 60), h = Math.floor(mins / 60), d = Math.floor(h / 24);
+    if (d > 0) return d + " d " + (h % 24) + " h";
+    if (h > 0) return h + " h " + (mins % 60) + " min";
+    return mins + " min";
+  }
+  function pill(key, label, state) {
+    // state: true = on, false = off, null = no data
+    var $el = $rx.find('[data-x="' + key + '"]');
+    $el.removeClass("label-default label-warning label-info")
+       .addClass(state === true ? "label-warning" : "label-default")
+       .text(label + " · " + (state === null ? "no data" : (state ? "on" : "off")));
+  }
+
+  // ---- render all fields from the metrics store ----
+  function render() {
+    var sleeping = asleep();
+    $("#xvgc-asleep").toggle(sleeping);
+
+    // Readiness
+    setx("soc", has("v.b.soc") ? Number(m("v.b.soc")).toFixed(0) : "–");
+    setx("v12", has("v.b.12v.voltage") ? Number(m("v.b.12v.voltage")).toFixed(1) : "–");
+    setx("chg12", yesNo("v.e.charging12v"));
+    setx("plug", has("xvg.v.c.plug.state") ? str("xvg.v.c.plug.state") : "–");
+    setx("park", truthy(m("v.e.on")) ? "Driving" : duration(m("v.e.parktime")));
+    setx("awake", !has("v.e.awake") ? "–" : truthy(m("v.e.on")) ? "On" : (sleeping ? "Asleep" : "Awake"));
+
+    // Climate
+    var hvac = truthy(m("v.e.hvac"));
+    var cstate = str("xvg.v.env.climate.state");
+    var $badge = $rx.find('[data-x="clbadge"]').removeClass("label-default label-warning label-danger label-success");
+    if (hvac) $badge.addClass("label-warning").text("Running");
+    else if (/^aborted/.test(cstate)) $badge.addClass("label-danger").text("Aborted");
+    else if (sleeping || cstate === "no data" || cstate === "–") $badge.addClass("label-default").text("No data");
+    else $badge.addClass("label-default").text("Off");
+    setx("cabin", bare("v.e.cabintemp", 1));
+    setx("setp", bare("v.e.cabinsetpoint", 1));
+    setx("outside", bare("v.e.temp", 1));
+    $rx.find("[data-xu]").each(function(){
+      var n = $(this).data("xu");
+      var l = (typeof units !== "undefined" && units.userUnitLabelFromMetric) ? units.userUnitLabelFromMetric(n) : "";
+      if (l) $(this).text(" " + l);
+    });
+    setx("clmode", str("xvg.v.env.climate.mode"));
+    setx("clstate", cstate);
+    setx("bpower", has("v.b.power") ? Number(m("v.b.power")).toFixed(1) : "–");
+
+    // Window + seat heating
+    var nodata = sleeping || !has("xvg.v.env.climate.heaters") || cstate === "no data";
+    pill("wfront", "Windscreen", nodata ? null : truthy(m("xvg.v.env.heated_front_window")));
+    pill("wrear", "Rear window", nodata ? null : truthy(m("xvg.v.env.heated_rear_window")));
+    var heaters = String(m("xvg.v.env.climate.heaters") || "");
+    pill("sfl", "Driver (FL)", nodata ? null : heaters.indexOf("seat front left") >= 0);
+    pill("sfr", "Passenger (FR)", nodata ? null : heaters.indexOf("seat front right") >= 0);
+
+    // Target temperature slider: follow the car until the user moves it
+    if (tempPending !== null && has("v.e.cabinsetpoint") &&
+        Math.abs(Math.round(Number(m("v.e.cabinsetpoint")) * 2) / 2 - tempPending) < 0.01) {
+      tempPending = null;   // the car now reports the saved value
+      tempDirty = false;
+    }
+    if (!tempDirty && has("v.e.cabinsetpoint")) {
+      var sp = Math.round(Number(m("v.e.cabinsetpoint")) * 2) / 2;
+      if (sp >= 15.5 && sp <= 30) $temp.val(sp);
+    }
+    updateSave();
+
+    // Vehicle
+    setx("locked", yesNo("v.e.locked"));
+    var open = [];
+    [["v.d.fl", "FL"], ["v.d.fr", "FR"], ["v.d.rl", "RL"], ["v.d.rr", "RR"]].forEach(function(d){
+      if (truthy(m(d[0]))) open.push(d[1]);
+    });
+    setx("doors", !has("v.d.fl") ? "–" : (open.length ? "Open: " + open.join(", ") : "All closed"));
+    setx("trunkhood", (has("v.d.trunk") ? (truthy(m("v.d.trunk")) ? "Open" : "Closed") : "–") + " / " +
+                      (has("v.d.hood") ? (truthy(m("v.d.hood")) ? "open" : "closed") : "–"));
+    setx("cp", has("v.d.cp") ? (truthy(m("v.d.cp")) ? "Open" : "Closed") : "–");
+    var g = has("v.e.gear") ? Number(m("v.e.gear")) : null;
+    var dm = has("v.e.drivemode") ? Number(m("v.e.drivemode")) : null;
+    var gtxt = g === null ? "–" : (g < 0 ? "R" : g > 0 ? "D/B" : "P/N");
+    var dtxt = dm === 1 ? "Normal" : dm === 2 ? "Eco" : dm === 3 ? "Eco+" : "–";
+    setx("gear", gtxt + " / " + dtxt);
+    setx("odo", num("v.p.odometer", 0, "km"));
+
+    // HV battery
+    setx("btemp", num("v.b.temp", 1, "°C"));
+    setx("bvolt", num("v.b.voltage", 0, "V"));
+    setx("bcurpow", (has("v.b.current") ? Number(m("v.b.current")).toFixed(1) + " A" : "–") + " / " +
+                    (has("v.b.power") ? Number(m("v.b.power")).toFixed(1) + " kW" : "–"));
+    setx("rest", num("v.b.range.est", 0, "km"));
+    setx("rideal", num("v.b.range.ideal", 0, "km"));
+    setx("bcap", num("v.b.capacity", 1, "kWh"));
+
+    // Charging
+    var bst = str("xvg.v.c.bcu.state");
+    setx("cstate", str("v.c.state") + (bst !== "–" && bst !== "no data" ? " (" + bst + ")" : ""));
+    setx("cplug", str("v.c.type") + " / " + str("xvg.v.c.plug.lock"));
+    setx("cpow", (has("v.c.power") ? Number(m("v.c.power")).toFixed(1) + " kW" : "–") + " / " +
+                 (has("v.c.current") ? Number(m("v.c.current")).toFixed(0) + " A" : "–"));
+    setx("climit", num("v.c.climit", 0, "A"));
+    var rem = has("xvg.v.c.bcu.remaining") ? Number(m("xvg.v.c.bcu.remaining")) : -1;
+    setx("cfull", rem >= 0 ? duration(rem * 60) : "–");
+    setx("ctimer", has("v.c.timermode") ? (truthy(m("v.c.timermode")) ? "On" : "Off") : "–");
+
+    // Module
+    setx("net", str("m.net.provider"));
+    setx("sq", num("m.net.sq", 0, "dBm"));
+    setx("v12b", num("v.b.12v.voltage", 1, "V"));
+    setx("bus", !has("v.e.awake") ? "–" : truthy(m("v.e.on")) ? "On" : (sleeping ? "Sleeping" : "Awake"));
+    setx("vin", str("v.vin"));
+
+    // Debug rows
+    $rx.find("[data-r]").each(function(){ $(this).text(str($(this).data("r"))); });
+  }
+
+  // ---- target temperature ----
+  function sliderVal() { return Number($temp.val()); }
+  function updateSave() {
+    var v = sliderVal();
+    $tempOut.text(v.toFixed(1) + " °C");
+    var carSp = has("v.e.cabinsetpoint") ? Math.round(Number(m("v.e.cabinsetpoint")) * 2) / 2 : null;
+    var same = (carSp !== null && Math.abs(carSp - v) < 0.01);
+    var waiting = (tempPending !== null && Math.abs(tempPending - v) < 0.01);
+    $save.prop("disabled", running || same || waiting);
+    $saveHint.text(carSp === null ? "Car value unknown"
+                 : same ? "Matches the car"
+                 : waiting ? "Saved — waiting for the car to report it"
+                 : "Not saved yet");
+  }
+  $temp.on("input change", function(){ tempDirty = true; updateSave(); });
+
+  // ---- commands ----
+  function setRunning(on) {
+    running = on;
+    $root.find(".xvgc-cmd").prop("disabled", on);
+    $busy.text(on ? "Waiting for the module…" : "");
+    updateSave();
+  }
+  var problem = /refused|unavailable|^Error|did not respond|Timed out|Unknown field|Usage:|expected|must be/m;
+  function send(cmd, timeout) {
+    if (running) return;
+    setRunning(true);
+    $outbox.removeClass("alert alert-warning");
+    $out.text("$ " + cmd + "\n");
+    var xhr = loadcmd(cmd, "+#xvgc-out", timeout || 20);
+    var done = function(){
+      setRunning(false);
+      if (problem.test($out.text())) $outbox.addClass("alert alert-warning");
+    };
+    if (xhr && xhr.always) xhr.always(done); else done();
+    return xhr;
+  }
+  function confirmThen(cmd, fn) {
+    if (!asleep()) { fn(); return; }
+    var body = '<p>The car is asleep. Sending this command wakes it, which draws on the 12V battery until it sleeps again.</p>' +
+               '<pre>' + $('<div/>').text(cmd).html() + '</pre>';
+    confirmdialog("Wake the car?", body, ["Cancel", "Wake car &amp; send"], function(idx){
+      if (idx == 1) fn();
+    });
+  }
+
+  $root.on("click", ".xvgc-cmd", function(ev){
+    ev.preventDefault();
+    var cmd = $(this).data("xcmd");
+    confirmThen(cmd, function(){ send(cmd); });
+  });
+
+  $save.on("click", function(ev){
+    ev.preventDefault();
+    var val = sliderVal();
+    var cmd = "xvg charge profile set 0 temp " + val.toFixed(1);
+    confirmThen(cmd, function(){
+      // Profile writes block up to ~22 s while the BCU wakes and answers.
+      var xhr = send(cmd, 40);
+      if (xhr && xhr.done) xhr.done(function(){
+        // Keep the slider on the saved value until the car reports it; on a failed write it stays
+        // "Not saved yet" so the user can retry.
+        if (/Profile 0 updated/.test($out.text())) tempPending = val;
+        render();
+      });
+    });
+  });
+
+  $("#xvgc-showm").on("change", function(){ $root.toggleClass("show-metrics", this.checked); });
+
+  // ---- live updates ----
+  $rx.on("msg:metrics", function(e, update){ render(); });
+  render();
+})();
+</script>
