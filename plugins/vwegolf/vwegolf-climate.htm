@@ -297,7 +297,7 @@
 
     // Readiness
     setx("soc", has("v.b.soc") ? Number(m("v.b.soc")).toFixed(0) : "–");
-    setx("v12", has("v.b.12v.voltage") ? Number(m("v.b.12v.voltage")).toFixed(1) : "–");
+    setx("v12", has("v.b.12v.voltage") ? Number(m("v.b.12v.voltage")).toFixed(2) : "–");
     setx("chg12", yesNo("v.e.charging12v"));
     setx("plug", has("xvg.v.c.plug.state") ? str("xvg.v.c.plug.state") : "–");
     setx("park", truthy(m("v.e.on")) ? "Driving" : duration(m("v.e.parktime")));
@@ -383,7 +383,7 @@
     // Module
     setx("net", str("m.net.provider"));
     setx("sq", num("m.net.sq", 0, "dBm"));
-    setx("v12b", num("v.b.12v.voltage", 1, "V"));
+    setx("v12b", num("v.b.12v.voltage", 2, "V"));
     setx("bus", !has("v.e.awake") ? "–" : truthy(m("v.e.on")) ? "On" : (sleeping ? "Sleeping" : "Awake"));
     setx("vin", str("v.vin"));
 
