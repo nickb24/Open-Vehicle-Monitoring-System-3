@@ -782,11 +782,24 @@ void VWeGolfBatteryControl::HandleAmbientStatus(const bap::Element& el) {
         el.func == bap::egolf::FUNC_CLIMATE_STATE) {
         HandleStatusProperty(el.func, el.body, el.bodyLen, kind);
     } else if (el.func == bap::egolf::FUNC_BAP_GETALL && el.opcode == bap::OP_STATUS) {
+        // Right after a BCU reset (a wake while not charging) the GetAll carries placeholders: PlugState
+        // 0f 00 ("unplugged") and ChargeState with SOC 0xFF, sent AFTER the correct PlugState status
+        // [WIRE 2026-11-20, wake-full-2: 1f 11 at +0.89 s, then the GetAll at +1.04 s]. A valid SOC marks
+        // a real GetAll (wake while charging: 0f 11 + SOC 79 %); otherwise plug / charge wait for their
+        // own status or heartbeat (+0.4 .. +13 s). ClimateState is still taken: it matched the heartbeats
+        // at every wake, and HeaterAlreadyOff() needs it before the profile reply.
+        const uint8_t* val = nullptr;
+        uint16_t vlen = 0;
+        bap::egolf::ChargeState chs;
+        const bool real = bap::egolf::findGetAllValue(el.body, el.bodyLen, bap::egolf::FUNC_CHARGE_STATE,
+                                                      &val, &vlen) &&
+                          bap::egolf::decodeChargeState(val, vlen, chs) && chs.soc <= 100;
+        if (!real)
+            ESP_LOGI(TAG, "GetAll: placeholder plug / charge values (SOC unknown) ignored");
         static const uint8_t kFuncs[] = {bap::egolf::FUNC_PLUG_STATE, bap::egolf::FUNC_CHARGE_STATE,
                                          bap::egolf::FUNC_CLIMATE_STATE};
         for (uint8_t f : kFuncs) {
-            const uint8_t* val = nullptr;
-            uint16_t vlen = 0;
+            if (!real && f != bap::egolf::FUNC_CLIMATE_STATE) continue;
             if (bap::egolf::findGetAllValue(el.body, el.bodyLen, f, &val, &vlen))
                 HandleStatusProperty(f, val, vlen, "getall");
         }

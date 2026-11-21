@@ -1101,6 +1101,23 @@ static const std::vector<uint8_t> kGetAll = {
     0x08, 0x00, 0xff, 0xff, 0xff, 0x09, 0x00, 0xc0, 0x03, 0x00,        // 0x15 timer 2
     0x08, 0x00, 0x1a, 0x08, 0x08, 0x10, 0x05, 0x01, 0x02, 0x00,        // 0x16 timer 3
 };
+// The GetAll at a wake while AC charging carries real values (wake-charging, 2026-11-20): plugged,
+// supply active; ChargeState AC running, SOC 79 %, 160 min remaining.
+static const std::vector<uint8_t> kGetAllCharging = {
+    0x03, 0x00, 0x25, 0x00, 0x04, 0x00,                                // 0x02 BAP_Config
+    0x08, 0x00, 0x78, 0x07, 0xfe, 0xe0, 0x00, 0x00, 0x00, 0x00,        // 0x03 FunctionList (len 8)
+    0x0a,                                                              // 0x04 heartbeat
+    0x00,                                                              // 0x0D
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,                                // 0x0E FSG_Setup
+    0x00,                                                              // 0x0F
+    0x0f, 0x11,                                                        // 0x10 PlugState
+    0x09, 0x00, 0x12, 0x4f, 0xa0, 0x00, 0xff, 0xff, 0x00, 0xff, 0x21,  // 0x11 ChargeState (len 9)
+    0x07, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0xbb, 0x00,              // 0x12 ClimateState (len 7)
+    0x03, 0x02,                                                        // 0x13 TimerState
+    0x08, 0x00, 0xff, 0xff, 0xff, 0x08, 0x1e, 0x02, 0x01, 0x00,        // 0x14 timer 1
+    0x08, 0x00, 0xff, 0xff, 0xff, 0x09, 0x00, 0xc0, 0x03, 0x00,        // 0x15 timer 2
+    0x08, 0x00, 0x1a, 0x08, 0x08, 0x10, 0x05, 0x01, 0x02, 0x00,        // 0x16 timer 3
+};
 
 // Pure decoders and names: confirmed values plain, firmware-only values "(unconfirmed)", undefined
 // values "unknown (N)".
@@ -1290,21 +1307,41 @@ void test_status_abort_notifications() {
     delete v;
 }
 
-// The GetAll reply that answers every channel open carries all three properties: the state is known
-// right at wake. The bus going to sleep resets the climate metrics but keeps plug / charge (charging
-// continues with the bus asleep), and a charge abort found at the next wake still notifies.
+// The GetAll reply at a wake carries all three properties. While charging they are real; at a wake
+// while not charging plug / charge are placeholders (SOC 0xFF) and must not overwrite the status, only
+// ClimateState is taken. The bus going to sleep resets the climate metrics but keeps plug / charge
+// (charging continues with the bus asleep), and a charge abort found at the next wake still notifies.
 void test_status_from_getall_and_sleep() {
     printf("\ntest_status_from_getall_and_sleep\n");
     g_metrics = MetricStore{};
     MyNotify = OvmsNotify{};
     auto* v = new OvmsVehicleVWeGolf();
 
+    // Placeholder GetAll alone: climate taken, plug / charge left alone.
     inject_bap_status(v, bap::egolf::FUNC_BAP_GETALL, kGetAll);
-    CHECK(str_metric("xvg.v.env.climate.state") == "idle", "GetAll -> climate state 'idle'");
-    CHECK(str_metric("xvg.v.c.bcu.mode") == "off" && str_metric("xvg.v.c.bcu.state") == "idle",
-          "GetAll -> charge mode 'off', state 'idle'");
-    CHECK(str_metric("xvg.v.c.plug.state") == "unplugged" && str_metric("xvg.v.c.plug.supply") == "inactive",
-          "GetAll -> plug 'unplugged', supply 'inactive'");
+    CHECK(str_metric("xvg.v.env.climate.state") == "idle", "placeholder GetAll -> climate state 'idle'");
+    CHECK(str_metric("xvg.v.c.bcu.state") == "no data" && str_metric("xvg.v.c.bcu.raw") == "",
+          "placeholder GetAll -> charge state not taken");
+    CHECK(str_metric("xvg.v.c.plug.state") == "no data", "placeholder GetAll -> plug state not taken");
+
+    // wake-full-2 order: the correct PlugState status, then the placeholder GetAll, then ChargeState.
+    inject_bap_status(v, bap::egolf::FUNC_PLUG_STATE, {0x1f, 0x11});
+    inject_bap_status(v, bap::egolf::FUNC_BAP_GETALL, kGetAll);
+    CHECK(str_metric("xvg.v.c.plug.state") == "plugged" && str_metric("xvg.v.c.plug.lock") == "locked" &&
+          str_metric("xvg.v.c.plug.supply") == "active", "status kept: placeholder GetAll doesn't say 'unplugged'");
+    inject_bap_status(v, bap::egolf::FUNC_CHARGE_STATE, {0x01, 0x50, 0xff, 0xff, 0xff, 0xff, 0x00, 0xff, 0x01});
+    CHECK(str_metric("xvg.v.c.bcu.state") == "idle" && str_metric("xvg.v.c.bcu.raw") == "01 50 ff ff ff ff 00 ff 01",
+          "ChargeState status taken");
+    inject_bap_status(v, bap::egolf::FUNC_BAP_GETALL, kGetAll);
+    CHECK(str_metric("xvg.v.c.bcu.raw") == "01 50 ff ff ff ff 00 ff 01", "placeholder GetAll keeps the real SOC");
+
+    // A GetAll with a valid SOC (wake while charging) is taken whole.
+    inject_bap_status(v, bap::egolf::FUNC_PLUG_STATE, {0x0f, 0x00});
+    inject_bap_status(v, bap::egolf::FUNC_BAP_GETALL, kGetAllCharging);
+    CHECK(str_metric("xvg.v.c.plug.state") == "plugged" && str_metric("xvg.v.c.plug.supply") == "active",
+          "charging GetAll -> plug 'plugged', supply 'active'");
+    CHECK(str_metric("xvg.v.c.bcu.mode") == "AC" && str_metric("xvg.v.c.bcu.state") == "running" &&
+          g_metrics.numbers["xvg.v.c.bcu.remaining"] == 160, "charging GetAll -> AC running, 160 min");
 
     inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, kCsWindow);
     CHECK(hvac_on() && bool_metric("xvg.v.env.heated_front_window"), "running with windscreen");
