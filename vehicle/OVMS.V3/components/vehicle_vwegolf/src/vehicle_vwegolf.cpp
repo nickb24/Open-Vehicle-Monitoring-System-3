@@ -467,18 +467,21 @@ void OvmsVehicleVWeGolf::DecodeFrame(CAN_frame_t* p_frame) {
         }
         case 0x583:  // ZV_02: central locking and door open states.
         {
-            // d[7] bits 7:6: 0x80 = locked, 0x40 = unlocked, both for the fob and the interior
-            // central-lock button; other values not seen on-car, metric left as is.
+            // d[7] bits 7:6: locking mode, 0x80 = locked, 0x40 = unlocked, for the fob, keyless entry
+            // and the interior central-lock button; other values not seen on-car, mode left as is.
+            // The mode stays locked when one door is unlocked by pulling its inside handle, so
+            // v.e.locked also checks every door's own lock bit (UpdateLocked).
             // d[2] is a lock-state value, not a flag: 0x0A locked with the fob (alarm armed),
-            // 0x05 locked from inside, 0x40 partly unlocked (single-press unlock), 0x80 all
-            // unlocked; reading its bit 1 alone showed a car locked from inside as unlocked.
+            // 0x05 locked from inside (0x04 while a door is unlocked by its inside handle), 0x40
+            // partly unlocked (driver side, single fob press), 0x80 all unlocked; reading its bit 1
+            // alone showed a car locked from inside as unlocked.
             // d[3] bits 4:0 (1 = open): tailgate, rear passenger side, rear driver side, passenger,
             // driver. d[6] bit 2 / bit 4: rear door driver side / passenger side locked. Driver /
             // passenger based like the window frames (OEM OCU); SideIndex() maps them to left / right.
             if ((d[7] & 0xC0) == 0x80)
-                StdMetrics.ms_v_env_locked->SetValue(true);
+                m_lock_mode = 1;
             else if ((d[7] & 0xC0) == 0x40)
-                StdMetrics.ms_v_env_locked->SetValue(false);
+                m_lock_mode = 0;
             {
                 OvmsMetricBool* const door[4] = {StdMetrics.ms_v_door_fl, StdMetrics.ms_v_door_fr,
                                                  StdMetrics.ms_v_door_rl, StdMetrics.ms_v_door_rr};
@@ -488,6 +491,7 @@ void OvmsVehicleVWeGolf::DecodeFrame(CAN_frame_t* p_frame) {
             StdMetrics.ms_v_door_trunk->SetValue((d[3] & 0x10) >> 4);
             m_door_lock[SideIndex(2)]->SetValue((d[6] & 0x04) != 0);
             m_door_lock[SideIndex(3)]->SetValue((d[6] & 0x10) != 0);
+            UpdateLocked();
             // ESP_LOGV(TAG, "0x0583 lock=0x%02x fl=%u fr=%u rl=%u rr=%u trunk=%u", d[7],
                      // d[3] & 0x1, (d[3] & 0x2) >> 1, (d[3] & 0x4) >> 2, (d[3] & 0x8) >> 3,
                      // (d[3] & 0x10) >> 4);
@@ -920,7 +924,10 @@ void OvmsVehicleVWeGolf::DecodeFrame(CAN_frame_t* p_frame) {
             const uint8_t seat = p_frame->MsgID == 0x3D0 ? 0 : p_frame->MsgID == 0x3D1 ? 1
                                : p_frame->MsgID == 0x3CE ? 2 : 3;
             const uint8_t idx = SideIndex(seat);
-            if (seat < 2) m_door_lock[idx]->SetValue((d[0] & 0x02) != 0);
+            if (seat < 2) {
+                m_door_lock[idx]->SetValue((d[0] & 0x02) != 0);
+                UpdateLocked();
+            }
             if (d[4] & 0x80) {
                 const int pct = (d[4] & 0x04) ? 0 : (d[3] + 1) / 2;
                 m_window[idx]->SetValue(pct > 100 ? 100 : pct);
@@ -981,6 +988,17 @@ void OvmsVehicleVWeGolf::DecodeFrame(CAN_frame_t* p_frame) {
             break;
         }
     }
+}
+
+// v.e.locked: the locking mode (0x583 d[7]) is locked and every door reports itself locked. On a car
+// locked from inside, pulling a door's inside handle unlocks only that door while the mode stays
+// locked (on-car 2026-11-22); the mode alone would then still read "locked".
+void OvmsVehicleVWeGolf::UpdateLocked() {
+    if (m_lock_mode < 0) return;
+    bool locked = m_lock_mode == 1;
+    for (OvmsMetricBool* door : m_door_lock)
+        locked = locked && door->AsBool();
+    StdMetrics.ms_v_env_locked->SetValue(locked);
 }
 
 // ---------------------------------------------------------------------------

@@ -103,18 +103,21 @@ cannot change then).
 Metric                           Meaning
 ================================ =========================================================================
 ``v.d.fl`` … ``v.d.rr``          Door open (standard metrics), ``v.d.trunk`` tailgate, ``v.d.hood`` bonnet
-``v.e.locked``                   Car locked (any lock method: key fob, keyless entry, central-lock button)
+``v.e.locked``                   All doors locked (key fob, keyless entry or central-lock button)
 ``xvg.v.d.lock.fl`` … ``rr``     Door locked, per door
 ``xvg.v.d.window.fl`` … ``rr``   Window position in % open (0 = closed, 100 = fully open, -1 = not seen yet)
 ``xvg.v.e.sidelights``           Light switch in the side-light position
 ``xvg.v.rhd``                    Steering side reported by the car: ``yes`` = right-hand drive
 ================================ =========================================================================
 
-* With single-press unlocking set in the car, the first press unlocks only the driver's door and the rear door
-  behind it; the per-door lock metrics show this
+* The car's unlock setting (infotainment menu: all doors, single door or vehicle side) decides which doors a key
+  fob press or a door handle unlocks, and on a car locked from inside a door's inside handle unlocks only that
+  door. Each door reports its own lock state: the per-door lock metrics show which doors are unlocked, and
+  ``v.e.locked`` reads ``no`` as soon as one door is unlocked
 * Left / right: the car reports doors, windows and locks per driver / passenger side. OVMS maps them to left / right
   using ``xvg.v.rhd``. This was verified on a left-hand-drive car only; the right-hand-drive mapping follows the OEM
-  telematics unit's firmware. Owners of right-hand-drive cars: please report on the OVMS forum whether ``xvg.v.rhd``
+  telematics unit's firmware. Owners of right-hand-drive cars: please report in a
+  `GitHub issue <https://github.com/openvehicles/Open-Vehicle-Monitoring-System-3/issues>`_ whether ``xvg.v.rhd``
   reads ``yes`` and whether the doors and windows show on the correct side
 
 ---------------------

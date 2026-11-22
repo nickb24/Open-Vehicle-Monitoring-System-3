@@ -152,6 +152,9 @@ class OvmsVehicleVWeGolf : public OvmsVehicle {
     OvmsMetricBool* m_rhd_metric = nullptr;      // xvg.v.rhd
     OvmsMetricInt*  m_window[4] = {};            // xvg.v.d.window.*: % open, 0 = closed, -1 = not seen
     OvmsMetricBool* m_door_lock[4] = {};         // xvg.v.d.lock.*: door locked
+    int8_t m_lock_mode = -1;                     // 0x583 d[7]: 1 locked, 0 unlocked, -1 not seen yet
+    // v.e.locked = locking mode locked and every door locked (see UpdateLocked in the .cpp).
+    void UpdateLocked();
     OvmsMetricBool* m_sidelights = nullptr;      // xvg.v.e.sidelights: light switch on side lights
     // Metric index for a driver / passenger based signal. seat: 0 driver, 1 passenger, 2 rear driver
     // side, 3 rear passenger side. LHD: the same; RHD: left and right swapped.

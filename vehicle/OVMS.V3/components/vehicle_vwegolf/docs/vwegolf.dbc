@@ -264,8 +264,8 @@ CM_ SG_ 1158 Latitude "Factor 1e-6 deg/LSB. Magnitude only (27 bits). Apply LatS
 CM_ SG_ 1158 LatSign "0=North, 1=South. Bit 55 (d[6] MSB). Inferred from bit layout; confirmed 0 for known N/E location. Needs S/W capture to fully verify.";
 CM_ SG_ 1158 Longitude "Factor 1e-6 deg/LSB. Magnitude only (28 bits). Apply LonSign for hemisphere.";
 CM_ SG_ 1158 LonSign "0=East, 1=West. Bit 56 (d[7] bit 0). Inferred from bit layout; confirmed 0 for known N/E location. Needs S/W capture to fully verify.";
-CM_ SG_ 1411 LockState "Lock state: 0x0A locked with the fob or KESSY (alarm armed), 0x05 locked from inside, 0x40 partly unlocked (single-press unlock), 0x80 all unlocked, 0x8A locked with the tailgate open; 0x08 / 0x04 briefly while locking. Not a plain lock flag: bit 1 alone reads a car locked from inside as unlocked.";
-CM_ SG_ 1411 Locked "2 = locked, 1 = unlocked, whatever the lock method; the only values seen on-car. Drives v.e.locked.";
+CM_ SG_ 1411 LockState "Lock state: 0x0A locked with the fob or KESSY (alarm armed), 0x05 locked from inside, 0x04 locked from inside with one door unlocked by its inside handle, 0x40 partly unlocked (driver side, single fob press), 0x80 all unlocked, 0x8A locked with the tailgate open; 0x08 / 0x04 briefly while locking. Not a plain lock flag: bit 1 alone reads a car locked from inside as unlocked.";
+CM_ SG_ 1411 Locked "Locking mode: 2 = locked, 1 = unlocked, whatever the lock method; the only values seen on-car. Stays 2 when one door is unlocked by its inside handle (only that door's DoorLocked / RearLock* bit clears). v.e.locked = Locked 2 and all four doors locked.";
 CM_ SG_ 976 WindowPos "0 = closed, ~200 raw (100 %) = fully open. Use only when WindowPosValid is set (clear in the first frames after a wake).";
 CM_ SG_ 976 WindowClosedStop "1 = window at its closed stop. The rear windows read raw 2 there, so OVMS reports 0 % when this bit is set.";
 CM_ SG_ 810 SteeringSide "1 = left-hand drive (seen on-car), 2 = right-hand drive (OEM OCU firmware, not yet seen on a car).";
