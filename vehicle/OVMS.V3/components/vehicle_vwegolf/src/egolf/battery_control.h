@@ -624,6 +624,12 @@ inline bool decodeClimateState(const uint8_t* b, uint16_t len, ClimateState& out
 inline bool climateStateIsAbort(uint8_t s) {
   return s != CS_INIT && s != 5 && s != CS_IDLE && s != CS_RUNNING && s != CS_COMPLETED;
 }
+// The seat / window heating state uses only some of these numbers; the others are not defined for it
+// ("unknown (N)"), so they are not treated as an abort.
+inline bool heaterStateIsAbort(uint8_t s) {
+  return s == CS_ABORT_IGNITION_ON || s == CS_ABORT_DEVICE_ERROR || s == CS_ABORT_BATTERY_CONDITION ||
+         s == CS_ABORT_BATTERY_LOW;
+}
 
 // ChargeState (func 0x11), 9 bytes [WIRE]:
 //   [0]   chargeMode (high nibble, ChargeModeValue) | chargeState (low nibble, ChargeStateValue)

@@ -297,6 +297,16 @@ class VWeGolfBatteryControl {
     // Bus asleep: the BCU is silent. Climate metrics read "no data" / off (climate can't run asleep);
     // plug / charge metrics keep their last values, since charging continues with the bus asleep.
     void ClearStatus();
+    // Climate / seat + window heating abort notifications are held for kAbortHoldSecs (see HeldAbort).
+    // HoldAbort runs on each ClimateState (RX task): starts, updates or drops the held notification.
+    // SendHeldAbort runs in Ticker1 and sends it once it has been held long enough.
+    struct HeldAbort {
+        uint8_t state = 0xFF;   // abort value held back, 0xFF = none
+        bool stopped = false;   // the session was running ("stopped"), else "not started"
+        uint8_t secs = 0;       // seconds held so far
+    };
+    void HoldAbort(HeldAbort& h, bool heater, uint8_t prev, uint8_t now);
+    void SendHeldAbort(HeldAbort& h, bool heater);
     // Whether the BCU's ClimateState currently owns v.e.hvac (fresh, and describing a BCU climate
     // session rather than "ignition on" / "init"); otherwise the clima ECU's 0x5EA bit decides.
     bool BapClimateAuthoritative() const;
@@ -377,6 +387,12 @@ class VWeGolfBatteryControl {
     uint8_t  m_cs_state           = 0xFF;  // last climateState
     uint8_t  m_hs_state           = 0xFF;  // last seatheaterWindowState (resets on sleep like m_cs_state)
     uint8_t  m_cs_age             = 0xFF;  // seconds since the last ClimateState (saturates at 255)
+    // The BCU reported "power reduction" for ~2 s in a running climate session, then "running" again
+    // [WIRE 2026-11-24]; climate kept running. A held abort that turns back into "running" is only
+    // logged. Longer than one ClimateState heartbeat (~13 s), so the BCU has repeated the state.
+    static constexpr uint8_t kAbortHoldSecs = 15;
+    HeldAbort m_cs_abort;                  // climate state machine
+    HeldAbort m_hs_abort;                  // seat / window heating state machine
     uint8_t  m_chs_state          = 0xFF;  // last chargeState
     uint8_t  m_plug_lock_state    = 0xFF;  // last plug lockState
     bool     m_status_cleared     = false; // ClearStatus() done since the last status property

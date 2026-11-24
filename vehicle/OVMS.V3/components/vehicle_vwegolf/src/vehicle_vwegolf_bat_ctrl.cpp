@@ -272,6 +272,8 @@ bool VWeGolfBatteryControl::Begin(BcOp op, bool enable, uint16_t param) {
 
 void VWeGolfBatteryControl::Ticker1(bool bus_alive) {
     if (m_cs_age < 0xFF) m_cs_age++;  // ClimateState freshness (owns v.e.hvac while fresh)
+    SendHeldAbort(m_cs_abort, false);  // climate / seat + window heating abort notifications
+    SendHeldAbort(m_hs_abort, true);
 
     // The clima ECU (0x5EA) and the BCU (0x17332510) go silent once the bus sleeps and so
     // can't refresh HVAC; clear it as a backstop so climate doesn't read "on" forever after
@@ -914,26 +916,61 @@ void VWeGolfBatteryControl::HandleClimateState(const uint8_t* body, uint16_t len
     }
 
     // Say why climate stopped or never started: the reasons the head unit shows popups for, and the
-    // rest of the abort values. "ignition on" and "car body open" are the normal end of a remote session
-    // (the driver got in), so they are only logged. Notify only on an observed transition, so a stale
-    // abort state at wake or a heartbeat repeat stays quiet.
-    if (prev != 0xFF && prev != cs.state && climateStateIsAbort(cs.state) && !climateStateIsAbort(prev) &&
-        cs.state != CS_ABORT_IGNITION_ON && cs.state != CS_ABORT_BODY_OPEN) {
-        char msg[96];
-        snprintf(msg, sizeof(msg), "Climate %s: %s", prev == CS_RUNNING ? "stopped" : "not started", state);
-        ESP_LOGW(TAG, "%s", msg);
-        MyNotify.NotifyString("alert", "xvg.climate", msg);
+    // rest of the abort values. Same for the BCU's separate seat / window heating state machine (low
+    // nibble of byte 5), where a value not defined for it ("unknown (N)") is only logged (above).
+    HoldAbort(m_cs_abort, false, prev, cs.state);
+    HoldAbort(m_hs_abort, true, hprev, cs.heaterState);
+}
+
+void VWeGolfBatteryControl::HoldAbort(HeldAbort& h, bool heater, uint8_t prev, uint8_t now) {
+    using namespace bap::egolf;
+    const char* what = heater ? "Window/seat heating" : "Climate";
+    const bool abort_now = heater ? heaterStateIsAbort(now) : climateStateIsAbort(now);
+    const bool abort_prev = heater ? heaterStateIsAbort(prev) : climateStateIsAbort(prev);
+    // "ignition on" and "car body open" are the normal end of a remote session (the driver got in), so
+    // they are only logged, and they also drop a held notification (the driver is at the car).
+    const bool driver = now == CS_ABORT_IGNITION_ON || now == CS_ABORT_BODY_OPEN;
+
+    if (h.state != 0xFF) {
+        if (now == CS_RUNNING || driver) {
+            char held[48], cur[48];
+            if (heater) { heaterStateName(h.state, held, sizeof(held)); heaterStateName(now, cur, sizeof(cur)); }
+            else        { climateStateName(h.state, held, sizeof(held)); climateStateName(now, cur, sizeof(cur)); }
+            h.state = 0xFF;
+            ESP_LOGI(TAG, "%s %s %u s after '%s': not notified", what, cur, (unsigned)h.secs, held);
+        } else if (abort_now) {
+            h.state = now;  // another abort value: notify the latest
+        }
+        return;
     }
-    // Same for the BCU's separate seat / window heating state machine (low nibble of byte 5).
-    if (hprev != 0xFF && hprev != cs.heaterState && climateStateIsAbort(cs.heaterState) &&
-        !climateStateIsAbort(hprev) && cs.heaterState != CS_ABORT_IGNITION_ON &&
-        cs.heaterState != CS_ABORT_BODY_OPEN) {
-        char msg[96];
-        snprintf(msg, sizeof(msg), "Window/seat heating %s: %s",
-                 hprev == CS_RUNNING ? "stopped" : "not started", hstate);
-        ESP_LOGW(TAG, "%s", msg);
-        MyNotify.NotifyString("alert", "xvg.climate", msg);
-    }
+
+    // Notify only on an observed transition, so a stale abort state at wake or a heartbeat repeat stays
+    // quiet; and only after kAbortHoldSecs (Ticker1), unless it runs again by then.
+    if (prev == 0xFF || prev == now || !abort_now || abort_prev || driver) return;
+    h.stopped = prev == CS_RUNNING;
+    h.secs = 0;
+    h.state = now;  // last: Ticker1 acts once this is set
+    char name[48];
+    if (heater) heaterStateName(now, name, sizeof(name));
+    else        climateStateName(now, name, sizeof(name));
+    ESP_LOGW(TAG, "%s %s: %s (notified in %u s unless it runs again)", what,
+             h.stopped ? "stopped" : "not started", name, (unsigned)kAbortHoldSecs);
+}
+
+void VWeGolfBatteryControl::SendHeldAbort(HeldAbort& h, bool heater) {
+    using namespace bap::egolf;
+    const uint8_t st = h.state;
+    if (st == 0xFF) return;
+    if (h.secs < 0xFF) h.secs++;
+    if (h.secs < kAbortHoldSecs) return;
+    h.state = 0xFF;
+    char name[48], msg[96];
+    if (heater) heaterStateName(st, name, sizeof(name));
+    else        climateStateName(st, name, sizeof(name));
+    snprintf(msg, sizeof(msg), "%s %s: %s", heater ? "Window/seat heating" : "Climate",
+             h.stopped ? "stopped" : "not started", name);
+    ESP_LOGW(TAG, "%s", msg);
+    MyNotify.NotifyString("alert", "xvg.climate", msg);
 }
 
 void VWeGolfBatteryControl::HandleChargeState(const uint8_t* body, uint16_t len, const char* kind,

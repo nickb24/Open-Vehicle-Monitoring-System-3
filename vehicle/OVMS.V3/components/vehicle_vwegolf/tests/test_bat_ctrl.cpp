@@ -1264,30 +1264,46 @@ void test_climate_state_owns_hvac() {
     delete v;
 }
 
+// Run Ticker1 n times (n seconds).
+static void tick_secs(OvmsVehicleVWeGolf* v, int n) {
+    static uint32_t t = 1000;
+    for (int i = 0; i < n; i++) call_ticker1(v, t++);
+}
+
+static const std::vector<uint8_t> kCsBattLow = {0x00, 0x00, 0x00, 0x0a, 0x00, 0xab, 0x00};
+
 // Notifications fire on an observed transition into an abort value, once. The normal end of a remote
-// session (driver switches on / opens a door) and a stale abort state at wake stay quiet.
+// session (driver switches on / opens a door) and a stale abort state at wake stay quiet. Climate
+// notifications are held for 15 s (see test_climate_abort_held); charge / plug ones are immediate.
 void test_status_abort_notifications() {
     printf("\ntest_status_abort_notifications\n");
     g_metrics = MetricStore{};
     MyNotify = OvmsNotify{};
     auto* v = new OvmsVehicleVWeGolf();
-    const std::vector<uint8_t> battLow = {0x00, 0x00, 0x00, 0x0a, 0x00, 0xab, 0x00};
+    const std::vector<uint8_t>& battLow = kCsBattLow;
 
     inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, battLow);
+    tick_secs(v, 20);
     CHECK(MyNotify.count == 0, "first state seen (no transition): no notification");
     inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, kCsRunning);
     inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, battLow);
+    tick_secs(v, 14);
+    CHECK(MyNotify.count == 0, "running -> battery low: held for 15 s");
+    tick_secs(v, 1);
     CHECK(MyNotify.count == 1 && MyNotify.last_subtype == "xvg.climate", "running -> battery low notifies");
     CHECK(MyNotify.last_value == "Climate stopped: aborted: battery low (unconfirmed)", "climate abort text");
     inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, battLow);
+    tick_secs(v, 20);
     CHECK(MyNotify.count == 1, "repeat of the same state: no second notification");
 
     inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, kCsIdle);
     inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, battLow);
+    tick_secs(v, 15);
     CHECK(MyNotify.count == 2 && MyNotify.last_value == "Climate not started: aborted: battery low (unconfirmed)",
           "idle -> battery low: 'not started'");
     inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, kCsRunning);
     inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, kCsIgnition);
+    tick_secs(v, 20);
     CHECK(MyNotify.count == 2, "running -> ignition on (driver got in): no notification");
 
     // ChargeState: running (AC) -> power supply not available.
@@ -1308,6 +1324,81 @@ void test_status_abort_notifications() {
     inject_bap_status(v, bap::egolf::FUNC_PLUG_STATE, {0x13, 0x11});
     CHECK(MyNotify.count == 4 && MyNotify.last_value == "Charge port lock: unlock error (unconfirmed)",
           "plug unlock error notifies");
+
+    delete v;
+}
+
+// A seat / window heating state that is not defined for it ("unknown (N)") is only logged. The false
+// alert of 2026-11-22 10:07 ("Window/seat heating not started: unknown (14)") came from such a value,
+// read from a ClimateState stitched together from two telegrams.
+void test_heater_unknown_state_no_alert() {
+    printf("\ntest_heater_unknown_state_no_alert\n");
+    g_metrics = MetricStore{};
+    MyNotify = OvmsNotify{};
+    auto* v = new OvmsVehicleVWeGolf();
+
+    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, kCsIdle);
+    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, {0x00, 0x00, 0x00, 0x0a, 0x00, 0xbe, 0x00});
+    CHECK(str_metric("xvg.v.env.climate.heaterstate") == "unknown (14)", "heater state 14 shown as unknown (14)");
+    CHECK(MyNotify.count == 0, "heater idle -> unknown (14): no notification");
+    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, {0x00, 0x00, 0x00, 0x0a, 0x00, 0xb7, 0x00});
+    tick_secs(v, 15);
+    CHECK(MyNotify.count == 1 &&
+          MyNotify.last_value == "Window/seat heating not started: aborted: device error (unconfirmed)",
+          "heater -> device error (a named abort) still notifies");
+
+    delete v;
+}
+
+// The BCU reported "power reduction" for ~2 s in a running climate session, then "running" again,
+// while climate kept running [WIRE 2026-11-24, capture reasm-3-climate-on]. An abort that turns back
+// into running within the 15 s hold is only logged; one that stays is notified; the driver getting
+// in drops it; a later abort value replaces the held one.
+void test_climate_abort_held() {
+    printf("\ntest_climate_abort_held\n");
+    g_metrics = MetricStore{};
+    MyNotify = OvmsNotify{};
+    auto* v = new OvmsVehicleVWeGolf();
+    const std::vector<uint8_t> running  = {0x05, 0x00, 0x00, 0x0a, 0x00, 0xcb, 0x00};  // [WIRE]
+    const std::vector<uint8_t> powerRed = {0x05, 0x00, 0x00, 0x0a, 0x00, 0xeb, 0x00};  // [WIRE]
+    const uint8_t F = bap::egolf::FUNC_CLIMATE_STATE;
+
+    inject_bap_status(v, F, running);
+    inject_bap_status(v, F, powerRed);
+    CHECK(str_metric("xvg.v.env.climate.state") == "aborted: power reduction (unconfirmed)",
+          "the metric shows the power reduction at once");
+    tick_secs(v, 2);
+    inject_bap_status(v, F, running);
+    tick_secs(v, 20);
+    CHECK(MyNotify.count == 0, "running -> power reduction -> running 2 s later: no notification");
+
+    inject_bap_status(v, F, powerRed);
+    tick_secs(v, 15);
+    CHECK(MyNotify.count == 1 && MyNotify.last_value == "Climate stopped: aborted: power reduction (unconfirmed)",
+          "power reduction that stays 15 s: notified");
+
+    inject_bap_status(v, F, running);
+    inject_bap_status(v, F, powerRed);
+    tick_secs(v, 3);
+    inject_bap_status(v, F, kCsIgnition);
+    tick_secs(v, 20);
+    CHECK(MyNotify.count == 1, "held abort, then ignition on (driver got in): dropped");
+
+    inject_bap_status(v, F, running);
+    inject_bap_status(v, F, powerRed);
+    tick_secs(v, 3);
+    inject_bap_status(v, F, kCsBattLow);
+    tick_secs(v, 12);
+    CHECK(MyNotify.count == 2 && MyNotify.last_value == "Climate stopped: aborted: battery low (unconfirmed)",
+          "another abort while held: the latest is notified, 15 s after the first");
+
+    // Seat / window heating: running -> device error -> running.
+    inject_bap_status(v, F, {0x00, 0x00, 0x00, 0x0a, 0x00, 0xbc, 0x00});
+    inject_bap_status(v, F, {0x00, 0x00, 0x00, 0x0a, 0x00, 0xb7, 0x00});
+    tick_secs(v, 2);
+    inject_bap_status(v, F, {0x00, 0x00, 0x00, 0x0a, 0x00, 0xbc, 0x00});
+    tick_secs(v, 20);
+    CHECK(MyNotify.count == 2, "heating running -> device error -> running: no notification");
 
     delete v;
 }
@@ -2003,13 +2094,15 @@ void test_status_extra_fields() {
     CHECK(bool_metric("xvg.v.env.heated_front_window") && bool_metric("xvg.v.env.heated_rear_window"),
           "heater bits 0x30 -> front + rear window metrics");
     CHECK(!hvac_on(), "window heating with cabin climate idle: v.e.hvac off");
-    // Heater state running -> battery low notifies; -> ignition on does not.
+    // Heater state running -> battery low notifies (after the 15 s hold); -> ignition on does not.
     inject_bap_status(v, FUNC_CLIMATE_STATE, {0x00, 0x00, 0x00, 0x0a, 0x00, 0xba, 0x00});
+    tick_secs(v, 15);
     CHECK(MyNotify.count == 1 && MyNotify.last_subtype == "xvg.climate" &&
           MyNotify.last_value == "Window/seat heating stopped: aborted: battery low (unconfirmed)",
           "heater state running -> battery low notifies");
     inject_bap_status(v, FUNC_CLIMATE_STATE, std::vector<uint8_t>(cb, cb + sizeof(cb)));
     inject_bap_status(v, FUNC_CLIMATE_STATE, {0x00, 0x00, 0x00, 0x0a, 0x00, 0xb2, 0x00});
+    tick_secs(v, 20);
     CHECK(MyNotify.count == 1, "heater state running -> ignition on: no notification");
     CHECK(!bool_metric("xvg.v.env.heated_rear_window"), "rear window metric clears with the bit");
 
@@ -2316,6 +2409,8 @@ void test_bat_ctrl_all() {
     test_climate_state_metrics();
     test_climate_state_owns_hvac();
     test_status_abort_notifications();
+    test_heater_unknown_state_no_alert();
+    test_climate_abort_held();
     test_bap_reassembler_timeout();
     test_status_from_getall_and_sleep();
     test_fcan_charging_fallback();
