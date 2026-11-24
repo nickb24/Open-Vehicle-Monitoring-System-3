@@ -151,7 +151,7 @@ static std::vector<uint8_t> arm_write_body(canbus* bus) {
     for (auto& r : bus->tx_log) {
         if (!r.extended || r.id != BAP_CMD_ID) continue;
         bap::Element el;
-        if (asmb.feed(r.data, r.len, el) && el.opcode == bap::OP_SET_GET &&
+        if (asmb.feed(r.data, r.len, el, 0) && el.opcode == bap::OP_SET_GET &&
             el.lsg == bap::egolf::kLsg && el.func == bap::egolf::FUNC_PROFILES_ARRAY) {
             return std::vector<uint8_t>(el.body, el.body + el.bodyLen);
         }
@@ -414,8 +414,8 @@ void test_climate_no_trigger_without_profile() {
 // Regression: the reassembler is reset per command (else the profile read jams after cmd 1)
 // ---------------------------------------------------------------------------
 
-void test_climate_multiple_commands_reset_assembler() {
-    printf("\ntest_climate_multiple_commands_reset_assembler\n");
+void test_climate_multiple_commands_stale_partials() {
+    printf("\ntest_climate_multiple_commands_stale_partials\n");
     g_metrics = MetricStore{};
     auto* v = new OvmsVehicleVWeGolf();
 
@@ -429,27 +429,32 @@ void test_climate_multiple_commands_reset_assembler() {
     auto e1 = make_kcan_frame(v, BAP_STS_ID, {0x49, 0x58, 0x01});
     v->IncomingFrameCan3(&e1);  // confirm
 
-    // Jam the reassembler BETWEEN commands: feed long-telegram START frames that are never
-    // continued, filling its pending slots (mirrors the wake-flood leaving half-reassembled
-    // telegrams). No command is in flight, so these must NOT be reset here.
+    // Leave half-reassembled telegrams BETWEEN commands: long-telegram START frames on every group
+    // that are never continued, plus a continuation that would fit one of them (mirrors frames lost
+    // in a wake flood). The old reassembler kept them and gave the 21-frame profile reply's
+    // continuations to them, so the 2nd command never read the profile and timed out.
     CAN_frame_t pf{};
     pf.MsgID = BAP_STS_ID; pf.origin = v->m_can3; pf.FIR.B.DLC = 8;
     const uint8_t partial[8] = {0x80, 0x28, 0x49, 0x59, 0x29, 0x01, 0x40, 0x00};  // long start, no cont
     for (int i = 0; i < 8; i++) pf.data.u8[i] = partial[i];
-    for (int i = 0; i < 6; i++) v->IncomingFrameCan3(&pf);
+    for (uint8_t g = 0; g < 4; g++) {
+        pf.data.u8[0] = (uint8_t)(0x80 | (g << 4));
+        for (int i = 0; i < 2; i++) v->IncomingFrameCan3(&pf);
+    }
+    auto stray = make_kcan_frame(v, BAP_STS_ID, {0xc0, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07});
+    v->IncomingFrameCan3(&stray);
 
-    // --- Command 2: must STILL read the profile and fire. The kickoff resets the jammed
-    // reassembler, so the 21-frame profile reply reassembles again. Without the reset this hangs
-    // (the stale slots steal the array's continuations) and the command times out.
+    // --- Command 2: must STILL read the profile and fire: its reply's start frame replaces the
+    // leftover on its group, so the continuations reach the reply.
     kcan(v)->tx_log.clear();
     g_metrics = MetricStore{};  // clear hvac
     v->CommandClimateControl(true);
     auto s2 = make_kcan_frame(v, BAP_STS_ID, {0x49, 0x58, 0x00});
-    v->IncomingFrameCan3(&s2);  // kickoff resets the reassembler
+    v->IncomingFrameCan3(&s2);
     inject_bap_status(v, bap::egolf::FUNC_BAP_CONFIG, {0x03, 0x00, 0x25, 0x00, 0x04, 0x00});  // ack -> GET
     inject_bap_status(v, bap::egolf::FUNC_PROFILES_ARRAY, make_profile0_array(0x06));
     CHECK(sent_trigger(kcan(v)),
-          "command 2: profile STILL read after reassembler churn -> trigger (reset works)");
+          "command 2: profile STILL read after leftover partial telegrams -> trigger");
     auto e2 = make_kcan_frame(v, BAP_STS_ID, {0x49, 0x58, 0x01});
     v->IncomingFrameCan3(&e2);
     CHECK(hvac_on(), "command 2 confirmed");
@@ -1307,6 +1312,47 @@ void test_status_abort_notifications() {
     delete v;
 }
 
+// Both BCU reassemblers get the receive time: a continuation more than 500 ms after its start frame
+// is dropped on KCAN and on FCAN (where the KCAN-idle gate and RX overflows cut telegrams), so a stale
+// start frame can't be completed by another telegram's continuation.
+void test_bap_reassembler_timeout() {
+    printf("\ntest_bap_reassembler_timeout\n");
+    g_metrics = MetricStore{};
+    MyNotify = OvmsNotify{};
+    auto* v = new OvmsVehicleVWeGolf();
+    auto feed = [&](bool fcan, uint32_t ms, std::initializer_list<uint8_t> bytes) {
+        g_tick_count = ms;  // mock: 1 tick = 1 ms
+        CAN_frame_t f = make_kcan_frame(v, BAP_STS_ID, bytes);
+        if (fcan) {
+            f.origin = v->m_can2;
+            v->IncomingFrameCan2(&f);
+        } else {
+            v->IncomingFrameCan3(&f);
+        }
+    };
+    const std::string before = str_metric("xvg.v.env.climate.state");
+
+    // ClimateState heartbeat, idle: start + continuation.
+    feed(false, 1000, {0x80, 0x07, 0x39, 0x52, 0x00, 0x00, 0x00, 0x0a});
+    feed(false, 1600, {0xc0, 0x00, 0xbb, 0x00});
+    CHECK(str_metric("xvg.v.env.climate.state") == before, "KCAN: continuation 600 ms late -> dropped");
+    feed(false, 2000, {0x80, 0x07, 0x39, 0x52, 0x00, 0x00, 0x00, 0x0a});
+    feed(false, 2050, {0xc0, 0x00, 0xbb, 0x00});
+    CHECK(str_metric("xvg.v.env.climate.state") == "idle", "KCAN: continuation 50 ms later -> idle");
+
+    // KCAN asleep (> 10 s without a KCAN frame): FCAN feeds the status. ClimateState running.
+    for (int i = 0; i <= 10; i++) call_ticker1(v, i);
+    feed(true, 20000, {0x80, 0x07, 0x39, 0x52, 0x11, 0x00, 0x00, 0x0a});
+    feed(true, 21000, {0xc0, 0x00, 0xcb, 0x00});
+    CHECK(str_metric("xvg.v.env.climate.state") == "idle", "FCAN: continuation 1 s late -> dropped");
+    feed(true, 22000, {0x80, 0x07, 0x39, 0x52, 0x11, 0x00, 0x00, 0x0a});
+    feed(true, 22050, {0xc0, 0x00, 0xcb, 0x00});
+    CHECK(str_metric("xvg.v.env.climate.state") == "running", "FCAN: continuation 50 ms later -> running");
+
+    g_tick_count = 0;
+    delete v;
+}
+
 // The GetAll reply at a wake carries all three properties. While charging they are real; at a wake
 // while not charging plug / charge are placeholders (SOC 0xFF) and must not overwrite the status, only
 // ClimateState is taken. The bus going to sleep resets the climate metrics but keeps plug / charge
@@ -2060,7 +2106,7 @@ static std::vector<uint8_t> timer_record_body(canbus* bus, uint8_t& func_out) {
     for (auto& r : bus->tx_log) {
         if (!r.extended || r.id != BAP_CMD_ID) continue;
         bap::Element el;
-        if (asmb.feed(r.data, r.len, el) && el.opcode == bap::OP_SET_GET &&
+        if (asmb.feed(r.data, r.len, el, 0) && el.opcode == bap::OP_SET_GET &&
             el.lsg == bap::egolf::kLsg && bap::egolf::timerSlotForFunc(el.func) >= 1) {
             func_out = el.func;
             return std::vector<uint8_t>(el.body, el.body + el.bodyLen);
@@ -2076,7 +2122,7 @@ static int timer_mask_written(canbus* bus) {
     for (auto& r : bus->tx_log) {
         if (!r.extended || r.id != BAP_CMD_ID) continue;
         bap::Element el;
-        if (asmb.feed(r.data, r.len, el) && el.opcode == bap::OP_SET_GET &&
+        if (asmb.feed(r.data, r.len, el, 0) && el.opcode == bap::OP_SET_GET &&
             el.lsg == bap::egolf::kLsg && el.func == bap::egolf::FUNC_TIMER_STATE && el.bodyLen >= 1)
             mask = el.body[0];
     }
@@ -2239,7 +2285,7 @@ void test_bat_ctrl_all() {
     test_climate_ignores_foreign_asg_array();
     test_climate_arm_sets_op_preserves_fields();
     test_climate_no_trigger_without_profile();
-    test_climate_multiple_commands_reset_assembler();
+    test_climate_multiple_commands_stale_partials();
     test_climate_confirm_sets_hvac();
     test_climate_hvac_from_5ea();
     test_climate_hvac_clears_on_sleep();
@@ -2270,6 +2316,7 @@ void test_bat_ctrl_all() {
     test_climate_state_metrics();
     test_climate_state_owns_hvac();
     test_status_abort_notifications();
+    test_bap_reassembler_timeout();
     test_status_from_getall_and_sleep();
     test_fcan_charging_fallback();
     // OCU-style arming: climate / window heating / seat heating as separate sequences

@@ -64,6 +64,7 @@ namespace bap {
 // observed on the wire (agreed by both RE sources); they are NOT the higher
 // DSI-RPC opcode enumeration, which is a different layer.
 enum Opcode : uint8_t {
+  OP_RESET      = 0,  // sent by a function ECU when its BAP layer (re)starts (with func 2)
   OP_GET        = 1,  // read current value
   OP_SET_GET    = 2,  // set value (command); function ECU replies with a status
   OP_HEARTBEAT  = 3,  // periodic status
@@ -72,6 +73,10 @@ enum Opcode : uint8_t {
   OP_ACK        = 6,
   OP_ERROR      = 7,  // command failed
 };
+
+// Function 2 is BAP-Config in every LSG. A Reset (OP_RESET) on it means the
+// sender's BAP layer restarted.
+constexpr uint8_t kFuncBapConfig = 0x02;
 
 // A fully-decoded BAP element: application header fields plus a VIEW of the
 // body -- `body` is never owned by the Element. Its lifetime depends on which
@@ -117,23 +122,30 @@ bool decodeElement(const uint8_t* elem, uint16_t len, Element& out);
 // a leading transport control byte:
 //
 //   short frame  : byte0 bit7 == 0  -> byte0/byte1 are the element header
-//   start frame  : byte0 = 0x80 | (group<<4)     ; byte1 = body length
+//   start frame  : byte0 = 0x80 | (group<<4) | (length>>8) ; byte1 = length & 0xFF
 //                  byte2/byte3 = element header  ; byte4.. = first body bytes
 //   continuation : byte0 = 0xC0 | (group<<4) | index ; byte1.. = body bytes
 //
 // `group` (0..3) allows up to four interleaved long messages; `index` is a
-// per-message continuation counter (start implies 0, first continuation is 0).
+// per-message continuation counter (start implies 0, first continuation is 0)
+// that wraps from 15 to 0.
 //
-// The length byte counts the BODY only (element length minus the 2-byte
-// header). Verified against a real capture: an 8-byte body / 10-byte element
-// is announced as 0x08. (One RE source's *encoder* wrote element length here;
+// The length counts the BODY only (element length minus the 2-byte header).
+// Verified against a real capture: an 8-byte body / 10-byte element is
+// announced as 0x08. (One RE source's *encoder* wrote element length here;
 // that is a bug relative to the wire and is deliberately not reproduced.)
+// The length is 12 bits wide: the low nibble of byte0 holds bits 8-11 (OCU
+// firmware; 0xFFF is reserved). It is 0 for every message the e-Golf BCU has
+// sent, but other devices send longer messages (the OCU firmware has 360-byte
+// buffers for the instrument cluster).
 
 inline bool isSegStart(uint8_t b) { return (b >> 4) >= 0x8 && (b >> 4) <= 0xB; }
 inline bool isSegCont(uint8_t b)  { return (b >> 4) >= 0xC; }
 inline bool isShortFrame(uint8_t b) { return (b & 0x80) == 0; }
 inline uint8_t segGroup(uint8_t b) { return (b >> 4) & 0x3; }
 inline uint8_t segIndex(uint8_t b) { return b & 0xF; }
+// Body length announced by a start frame (bytes 0 and 1).
+inline uint16_t segLength(uint8_t b0, uint8_t b1) { return (uint16_t)(((b0 & 0x0F) << 8) | b1); }
 
 // Little-endian 16-bit helpers (BAP multi-byte scalars are little-endian).
 inline void putLe16(uint8_t* p, uint16_t v) { p[0] = v & 0xFF; p[1] = (v >> 8) & 0xFF; }
@@ -299,38 +311,56 @@ SendResult sendElement(Sink&& sink, Opcode opcode, uint8_t lsg, uint8_t func,
 // ---------------------------------------------------------------------------
 // Reassembly
 // ---------------------------------------------------------------------------
-// Feed raw CAN frames (for a SINGLE arbitration id) one at a time. When a
-// complete element is ready, feed() returns true and fills `out`; out.body
-// points into internal storage valid until the next feed() (see Element). Short
-// frames complete immediately; long messages accumulate across frames, matched
-// by group + continuation index. If a start arrives with no free slot, the
-// stalest in-flight message is evicted, so a dropped continuation can never
-// permanently wedge the pool.
+// Feed raw CAN frames (for a SINGLE arbitration id) one at a time, with the
+// time each was received in milliseconds (any free-running clock; only
+// differences are used, so wrap-around is fine). When a complete element is
+// ready, feed() returns true and fills `out`; out.body points into internal
+// storage valid until the next feed() (see Element). Short frames complete
+// immediately.
 //
-// MaxBody caps a reassembled body: the transport length field is one byte, so
-// 255 is the protocol maximum and the default 256 leaves 1 byte of headroom.
-// MaxPending defaults to 4 -- the transport `group` field is 2 bits, so at most
-// 4 streams are addressable. Shrink both for tighter RAM, e.g. AssemblerT<160,4>
-// (~0.8 KB) instead of the ~1.3 KB default.
+// Long messages follow the receiver rules of a VW OCU firmware, so a lost frame
+// loses only its own message and frames of two messages are never joined:
+//   * A sender has at most one long message in flight per group, so each group
+//     holds at most one message. A start frame replaces the message in progress
+//     on its group (the sender gave it up).
+//   * A continuation must carry the next index of its group's message;
+//     otherwise a frame was lost and the message is dropped. A continuation
+//     with no message in progress is ignored.
+//   * Every frame but the last must be full (4 body bytes in the start frame, 7
+//     in a continuation); a shorter one drops the message.
+//   * More than kTimeoutMs between two frames of a message drops it. Without
+//     this, a message whose last frames were lost would wait forever and could
+//     later be completed by the frames of another message.
+//   * A BAP Reset (OP_RESET on kFuncBapConfig) drops every message in progress.
+//
+// MaxBody caps a reassembled body; a longer message is dropped (counted in
+// overflowDrops). MaxPending is the number of messages held at once: with 4
+// (one per group) none is ever evicted; fewer saves RAM, and a start that finds
+// every slot busy then evicts the least recently active message.
 template <uint16_t MaxBody = 256, uint8_t MaxPending = 4>
 class AssemblerT {
+  static_assert(MaxPending >= 1 && MaxPending <= 4, "one message per group, 4 groups");
+
  public:
   static constexpr uint16_t kMaxBody = MaxBody;
   static constexpr uint8_t kMaxPending = MaxPending;
+  // Longest gap allowed between two frames of one message (OCU: 50 x 10 ms).
+  static constexpr uint32_t kTimeoutMs = 500;
 
   void reset() {
     for (uint8_t i = 0; i < MaxPending; i++) pending_[i].active = false;
   }
 
-  bool feed(const uint8_t* data, uint8_t dlc, Element& out) {
+  bool feed(const uint8_t* data, uint8_t dlc, Element& out, uint32_t nowMs) {
     if (dlc < 1) return false;
     if (dlc > 8) { badDlc_++; return false; }  // classic CAN caps a frame at 8 bytes
-    uint8_t ctrl = data[0];
+    const uint8_t ctrl = data[0];
 
     // Short single-frame element: header at byte 0, body follows.
     if (isShortFrame(ctrl)) {
       if (dlc < 2) return false;
       decodeHeader(data, out.opcode, out.lsg, out.func);
+      if (out.opcode == OP_RESET && out.func == kFuncBapConfig) reset();  // the sender restarted
       out.bodyLen = (uint16_t)(dlc - 2);       // <= 6
       if (out.bodyLen) {
         memcpy(shortBuf_, data + 2, out.bodyLen);
@@ -341,61 +371,67 @@ class AssemblerT {
       return true;
     }
 
+    const uint8_t group = segGroup(ctrl);
+    const int cur = slotFor(group);
+
     // Long start frame: 0x8x len hdr0 hdr1 body[0..3]
     if (isSegStart(ctrl)) {
-      if (dlc < 4) return false;
-      if (data[1] > MaxBody) { overflowDrops_++; return false; }  // can never complete
-      Pending& pm = pending_[allocSlot()];
-      pm.active = true;
-      pm.group = segGroup(ctrl);
+      if (cur >= 0) { replaced_++; pending_[cur].active = false; }
+      if (dlc < 4) { truncatedDrops_++; return false; }
+      const uint16_t len = segLength(ctrl, data[1]);
+      if (len > MaxBody) { overflowDrops_++; return false; }  // can never complete
+      const uint8_t first = (uint8_t)(len < 4 ? len : 4);
+      if (dlc - 4 < first) { truncatedDrops_++; return false; }
+      Pending& pm = pending_[cur >= 0 ? cur : allocSlot()];
+      pm.group = group;
       pm.nextIndex = 0;
-      pm.expected = data[1];
+      pm.expected = len;
       pm.hdr0 = data[2];
       pm.hdr1 = data[3];
-      pm.got = 0;
-      pm.startedAt = seq_++;
-      uint8_t chunk = (uint8_t)((dlc > 4) ? (dlc - 4) : 0);  // <= 4 after the DLC clamp
-      if (chunk > pm.expected) chunk = (uint8_t)pm.expected;
-      if (chunk) {
-        memcpy(pm.buf, data + 4, chunk);
-        pm.got = chunk;
-      }
+      memcpy(pm.buf, data + 4, first);
+      pm.got = first;
+      pm.lastMs = nowMs;
+      pm.lastSeq = seq_++;
       if (pm.got >= pm.expected) return complete(pm, out);
+      pm.active = true;
       return false;
     }
 
     // Long continuation frame: 0xCx body...
-    if (isSegCont(ctrl)) {
-      int idx = findPending(segGroup(ctrl), segIndex(ctrl));
-      if (idx < 0) { droppedOrphans_++; return false; }  // no matching start (lost/misordered)
-      Pending& pm = pending_[idx];
-      uint8_t chunk = (uint8_t)((dlc > 1) ? (dlc - 1) : 0);
-      uint16_t remaining = (uint16_t)(pm.expected - pm.got);
-      if (chunk > remaining) chunk = (uint8_t)remaining;
-      if (chunk && (uint16_t)(pm.got + chunk) <= MaxBody) {
-        memcpy(pm.buf + pm.got, data + 1, chunk);
-        pm.got = (uint16_t)(pm.got + chunk);
-      }
-      pm.nextIndex = (pm.nextIndex + 1) & 0xF;
-      if (pm.got >= pm.expected) return complete(pm, out);
-      return false;
-    }
+    if (cur < 0) { droppedOrphans_++; return false; }  // no message in progress (start lost)
+    Pending& pm = pending_[cur];
+    pm.active = false;  // dropped unless this frame checks out
+    if ((uint32_t)(nowMs - pm.lastMs) > kTimeoutMs) { timeouts_++; return false; }
+    if (segIndex(ctrl) != pm.nextIndex) { sequenceDrops_++; return false; }
+    const uint16_t remaining = (uint16_t)(pm.expected - pm.got);  // > 0 while active
+    const uint8_t chunk = (uint8_t)(remaining < 7 ? remaining : 7);
+    if (dlc - 1 < chunk) { truncatedDrops_++; return false; }
+    memcpy(pm.buf + pm.got, data + 1, chunk);
+    pm.got = (uint16_t)(pm.got + chunk);
+    pm.nextIndex = (uint8_t)((pm.nextIndex + 1) & 0xF);
+    pm.lastMs = nowMs;
+    pm.lastSeq = seq_++;
+    if (pm.got >= pm.expected) return complete(pm, out);
+    pm.active = true;
     return false;
   }
 
   // Monotonic diagnostic counters for the RX task to poll/log. They surface the
   // drops feed()'s bool return can't distinguish from a normal in-progress
-  // frame: continuations with no matching start (lost or misordered), evicted
-  // stale partials, starts whose declared length exceeds MaxBody, and malformed
-  // (>8-byte) DLCs.
+  // frame.
   struct Stats {
-    uint32_t droppedOrphans;
-    uint32_t evictions;
-    uint32_t overflowDrops;
-    uint32_t badDlc;
+    uint32_t droppedOrphans;  // continuation with no message in progress (its start was lost)
+    uint32_t evictions;       // message evicted by a start (only with MaxPending < 4)
+    uint32_t overflowDrops;   // start frame announcing a body longer than MaxBody
+    uint32_t badDlc;          // frame longer than 8 bytes
+    uint32_t replaced;        // message given up: a new start frame on its group
+    uint32_t sequenceDrops;   // message dropped: a continuation index was skipped
+    uint32_t truncatedDrops;  // message dropped: a frame shorter than its content
+    uint32_t timeouts;        // message dropped: more than kTimeoutMs between frames
   };
   Stats stats() const {
-    return {droppedOrphans_, evictions_, overflowDrops_, badDlc_};
+    return {droppedOrphans_, evictions_,     overflowDrops_,  badDlc_,
+            replaced_,       sequenceDrops_, truncatedDrops_, timeouts_};
   }
 
  private:
@@ -407,31 +443,26 @@ class AssemblerT {
     uint8_t hdr1 = 0;
     uint16_t expected = 0;
     uint16_t got = 0;
-    uint32_t startedAt = 0;   // eviction order (see allocSlot)
+    uint32_t lastMs = 0;      // time of the last frame (inter-frame timeout)
+    uint32_t lastSeq = 0;     // eviction order (see allocSlot)
     uint8_t buf[MaxBody];     // also backs the emitted Element for long messages
   };
 
-  int findPending(uint8_t group, uint8_t index) const {
-    // Backward search: newest matching stream wins, tolerant of interleaving.
-    for (int i = MaxPending - 1; i >= 0; i--) {
-      const Pending& pm = pending_[i];
-      if (pm.active && pm.group == group && pm.nextIndex == index &&
-          pm.got < pm.expected) {
-        return i;
-      }
-    }
+  // The slot holding the message in progress on `group`, or -1.
+  int slotFor(uint8_t group) const {
+    for (uint8_t i = 0; i < MaxPending; i++)
+      if (pending_[i].active && pending_[i].group == group) return i;
     return -1;
   }
 
-  // A slot for a new start: a free one if any, else evict the stalest in-flight
-  // message (lowest startedAt). Guarantees forward progress on a lossy bus -- a
-  // dropped continuation abandons the stalest partial rather than wedging the pool.
+  // A slot for a start on a group with no message in progress: a free one, else
+  // (MaxPending < 4 only) the least recently active message is evicted.
   uint8_t allocSlot() {
     for (uint8_t i = 0; i < MaxPending; i++)
       if (!pending_[i].active) return i;
     uint8_t oldest = 0;
     for (uint8_t i = 1; i < MaxPending; i++)
-      if (pending_[i].startedAt < pending_[oldest].startedAt) oldest = i;
+      if ((uint32_t)(seq_ - pending_[i].lastSeq) > (uint32_t)(seq_ - pending_[oldest].lastSeq)) oldest = i;
     evictions_++;
     return oldest;
   }
@@ -454,6 +485,10 @@ class AssemblerT {
   uint32_t evictions_ = 0;
   uint32_t overflowDrops_ = 0;
   uint32_t badDlc_ = 0;
+  uint32_t replaced_ = 0;
+  uint32_t sequenceDrops_ = 0;
+  uint32_t truncatedDrops_ = 0;
+  uint32_t timeouts_ = 0;
 };
 
 using Assembler = AssemblerT<>;
@@ -473,13 +508,13 @@ using Assembler = AssemblerT<>;
 template <uint8_t N, uint16_t MaxBody = 256, uint8_t MaxPending = 4>
 class AssemblerSetT {
  public:
-  // Route one frame by its CAN id. Returns true and fills `out` when that id's
-  // stream completes an element.
-  bool feed(uint32_t canId, const uint8_t* data, uint8_t dlc, Element& out) {
+  // Route one frame by its CAN id (nowMs: receive time, see AssemblerT::feed).
+  // Returns true and fills `out` when that id's stream completes an element.
+  bool feed(uint32_t canId, const uint8_t* data, uint8_t dlc, Element& out, uint32_t nowMs) {
     for (uint8_t i = 0; i < N; i++)
-      if (used_[i] && id_[i] == canId) return asm_[i].feed(data, dlc, out);
+      if (used_[i] && id_[i] == canId) return asm_[i].feed(data, dlc, out, nowMs);
     for (uint8_t i = 0; i < N; i++)
-      if (!used_[i]) { used_[i] = true; id_[i] = canId; return asm_[i].feed(data, dlc, out); }
+      if (!used_[i]) { used_[i] = true; id_[i] = canId; return asm_[i].feed(data, dlc, out, nowMs); }
     unknownDrops_++;
     return false;
   }

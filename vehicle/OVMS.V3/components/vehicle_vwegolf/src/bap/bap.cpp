@@ -71,8 +71,9 @@ SendResult sendElementFn(FrameSinkFn sink, void* ctx, uint8_t opcode, uint8_t ls
     return {SendResult::Ok, 1};
   }
 
-  // The start frame's length field is one byte, so a body over 255 cannot be
-  // framed -- refuse rather than silently truncate the length.
+  // This sender writes only the low byte of the 12-bit length (no message it
+  // sends is longer), so a body over 255 is refused rather than framed with a
+  // truncated length.
   if (bodyLen > 255) return {SendResult::Refused, 0};
 
   // Long: start frame carries the header + first 4 body bytes.

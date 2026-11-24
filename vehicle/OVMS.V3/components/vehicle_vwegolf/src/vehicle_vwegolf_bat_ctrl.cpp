@@ -41,6 +41,11 @@
 // records). Early-completion (all slots + mask) still finishes a lucky wake in a few seconds.
 static constexpr uint8_t kTimerCollectSecs = 15;
 
+// Receive time for the BAP reassemblers (their 500 ms inter-frame timeout), in ms.
+static uint32_t BapNowMs() {
+    return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+}
+
 // ---------------------------------------------------------------------------
 // Command entry
 // ---------------------------------------------------------------------------
@@ -423,22 +428,18 @@ void VWeGolfBatteryControl::IncomingBapStatus(const CAN_frame_t* p_frame) {
     // opens the command and clears a transient TX-fail. The reply telegrams then step the sequence:
     // profile array -> arm+trigger, OperationMode echo -> confirm.
     //
-    // Start each command with a CLEAN reassembler. This is the RX task — the only one that touches
-    // m_bap_asm — so resetting here (rather than in Command()'s task) can't race feed(). Command()
-    // cleared m_bcu_seen, so the first status frame of a new command triggers this once. Without
-    // it, long telegrams left half-reassembled from the previous command / broadcast flood keep the
-    // 4 pending slots occupied, and the 21-frame profile-array (49 59) reply's continuations get
-    // misrouted so it never completes on the 2nd+ command — short frames still complete (so the GET
-    // still goes out), but the profile is never read and the command times out.
+    // The reassembler needs no reset per command: it drops a message whose frames were lost (index
+    // gap, 500 ms gap or a new start on its group), so leftovers from an earlier wake can't take
+    // the profile-array reply's continuations.
     if (!m_bcu_seen) {
-        m_bap_asm.reset();
         for (auto& s : m_status_seen) s.len = 0;  // log each status once per command, even if unchanged
     }
     m_bcu_seen = true;
 
     const uint8_t* d = p_frame->data.u8;
     bap::Element el;
-    if (!m_bap_asm.feed(p_frame->MsgID, d, p_frame->FIR.B.DLC, el) || el.lsg != bap::egolf::kLsg) {
+    if (!m_bap_asm.feed(p_frame->MsgID, d, p_frame->FIR.B.DLC, el, BapNowMs()) ||
+        el.lsg != bap::egolf::kLsg) {
         return;
     }
     m_tx_fail = false;  // the BCU is answering, so the transmit path is healthy
@@ -759,7 +760,9 @@ void VWeGolfBatteryControl::IncomingFcanBapStatus(const CAN_frame_t* p_frame) {
     // FCAN copy of the BCU stream, only fed while KCAN sleeps (see OvmsVehicleVWeGolf::IncomingFrameCan2).
     // Passive: no m_bcu_seen / handshake / command progress — KCAN alone drives the commands.
     bap::Element el;
-    if (!m_fcan_asm.feed(p_frame->data.u8, p_frame->FIR.B.DLC, el) || el.lsg != bap::egolf::kLsg) return;
+    if (!m_fcan_asm.feed(p_frame->data.u8, p_frame->FIR.B.DLC, el, BapNowMs()) ||
+        el.lsg != bap::egolf::kLsg)
+        return;
     HandleAmbientStatus(el);
 }
 
