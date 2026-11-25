@@ -587,6 +587,7 @@ void test_window_heat_0x594() {
 extern void test_crtd_replay();
 extern void test_bat_ctrl_all();
 extern void test_bap_all();
+extern void test_wake_all();
 
 int main() {
     printf("=== vehicle_vwegolf CAN decode tests ===\n");
@@ -607,6 +608,7 @@ int main() {
     test_crtd_replay();
     test_bat_ctrl_all();
     test_bap_all();
+    test_wake_all();
 
     printf("\n%d/%d tests passed\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

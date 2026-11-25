@@ -45,11 +45,13 @@
 // and we suppress OCU keepalive transmission to avoid accumulating TX errors.
 #define VWEGOLF_BUS_TIMEOUT_SECS 10
 
-// Session length limits after WakeKcanBus. OCU keepalive + NM alive stop when the
-// ring quiesces post-ACK (grace) or if no ACK arrives (hard cap). Without these,
-// we talk alone on a sleeping ring, every TX fails ACK, TEC storms for minutes.
-#define VWEGOLF_OCU_ACK_GRACE_SECS 5
-#define VWEGOLF_OCU_SESSION_CAP_SECS 30
+// `wakeup` session (WakeKcanBus): OVMS holds its NM wake request this long, like the OCU's 10 s
+// status wake. The car's gateway keeps the bus up ~15-17 s after an active wake anyway, enough for
+// one BCU heartbeat (~13 s). The 0x5A7 frame stops with it.
+#define VWEGOLF_WAKE_HOLD_SECS 10
+// `wakeup` reports success once the BCU is heard on KCAN; it answers ~0.3 s after the wake frame
+// gets through (6 of 8 wake captures).
+#define VWEGOLF_WAKE_ANSWER_MS 3000
 
 class OvmsVehicleVWeGolf : public OvmsVehicle {
  public:
@@ -73,8 +75,9 @@ class OvmsVehicleVWeGolf : public OvmsVehicle {
     vehicle_command_t CommandStartCharge() override;  // immediate charge start (on-car validated)
     vehicle_command_t CommandStopCharge() override;   // immediate charge stop (op-specific; blocked while climate on)
     void SendOcuHeartbeat();
-    void SendNmAlive();
-    void WakeKcanBus();
+    void SendWakeNm(bool release);  // one NM frame of the `wakeup` session (or its last one)
+    bool WakeKcanBus();             // false if the KCAN controller could not be restarted
+    void EndWakeSession(const char* why, bool release);
 
  protected:
     void Ticker1(uint32_t ticker) override;
@@ -99,32 +102,26 @@ class OvmsVehicleVWeGolf : public OvmsVehicle {
     // Initialized to timeout so we treat the bus as offline at cold boot.
     uint8_t m_bus_idle_ticks = VWEGOLF_BUS_TIMEOUT_SECS;
 
-    // Seconds since the last non-zero 0x5A7 from the OEM OCU. While the car is on or
-    // just turned off, the OEM OCU sends non-zero 0x5A7 frames that conflict with our
-    // all-zeros heartbeat (arbitration loss → bus-off). Must not wake while this is <
-    // CLIMA_WAKE_SECS. Initialized to timeout so cold boot treats the OEM OCU as absent.
+    // Seconds since the car's own OCU was last seen: its KN frame 0x17F00067 (every 500 ms while it is
+    // awake), an NM frame from its node 0x67 (OVMS never sends as 0x67), or a non-zero 0x5A7. While it
+    // is present, OVMS sends no 0x5A7: two senders with different data on one id cause bus errors.
+    // Initialized to timeout so cold boot treats the OEM OCU as absent.
     uint8_t m_oem_ocu_idle_ticks = VWEGOLF_BUS_TIMEOUT_SECS;
 
-    // OVMS must send the 0x5A7 OCU keepalive while it is an active node.
-    // VW OSEK NM requires keepalives at ~200ms intervals — Ticker1 alone (1Hz) is
-    // insufficient. We enforce a 180ms minimum interval via a FreeRTOS tick timestamp
-    // checked on every incoming KCAN frame, giving ~5Hz without storm risk when the
-    // bus gets a sudden traffic burst (e.g. from an NM wake).
-    // We only start sending after deliberately taking an action (wakeup or command)
-    // to avoid asserting an unexpected node presence when the car is idle.
-    bool m_ocu_active = false;
-    uint32_t m_last_heartbeat_tick = 0;
-
-    // Session bounds (seconds, incremented in Ticker1 while m_ocu_active).
-    // Without a bounded session, NM alive + heartbeat keep firing after the ring
-    // quiesces; every TX fails ACK, TEC storms for minutes. See cap 20260422-173035.
-    // Session cap ends it if no ACK arrives; grace ends it shortly after an ACK.
-    uint8_t m_ocu_session_secs = 0;
-    uint8_t m_ocu_grace_secs = 255;  // 255 = no ACK seen yet
+    // `wakeup` session: NM wake request as the spare node + the 0x5A7 frame (which carries the
+    // mirror / lock / horn request flags), both once a second from Ticker1, for
+    // VWEGOLF_WAKE_HOLD_SECS. Only started by `wakeup`, so OVMS never shows up as a node unasked.
+    bool m_wake_session = false;
+    uint8_t m_wake_secs = 0;           // seconds since the session started
+    bool m_wake_ocu_noted = false;     // "OEM OCU seen" logged for this session
+    vwegolf_nm::Sender m_wake_nm{VWEGOLF_NM_WAKE_NODE};
+    // BCU status frames (0x17332510) received on KCAN; `wakeup` waits for this to change. Written by
+    // the CAN RX task, read by the command's task.
+    volatile uint32_t m_kcan_bcu_rx = 0;
 
     // BatteryControl (LSG 0x25) controller: remote climate AND charge, which share one BAP
     // command path (handshake -> GET profile 0 -> RMW-arm -> trigger). Self-contained (see
-    // vehicle_vwegolf_bat_ctrl.h): owns its own spare-node NM wake, independent of the OCU 0x5A7
+    // vehicle_vwegolf_bat_ctrl.h): owns its own spare-node NM wake, independent of the 0x5A7
     // heartbeat above. Ticker1 forwards it a tick; IncomingFrameCan3 forwards it the BCU status
     // (0x17332510) and clima ECU status (0x5EA) frames.
     VWeGolfBatteryControl m_batctrl;

@@ -14,7 +14,8 @@ SRC := mock/mock_ovms.cpp \
        test_can_decode.cpp \
        test_crtd_replay.cpp \
        test_bap.cpp \
-       test_bat_ctrl.cpp
+       test_bat_ctrl.cpp \
+       test_wake.cpp
 
 all: test
 

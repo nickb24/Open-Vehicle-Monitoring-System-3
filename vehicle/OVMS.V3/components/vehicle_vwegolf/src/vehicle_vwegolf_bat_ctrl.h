@@ -29,14 +29,14 @@
 #include "can.h"
 #include "ovms_metrics.h"
 #include "egolf/battery_control.h"  // BatteryControl (LSG 0x25) BAP command + status codec
+#include "egolf/nm.h"               // NM wake frame (OCU layout, spare node)
 
-// Climate uses a dedicated, non-colliding CAN-NM wake from a SPARE (unused) node id
-// instead of impersonating the real OCU. On a car with a live OCU, sending the OCU's
-// node-0x67 NM frame and/or its 0x5A7 heartbeat collides with it (same id, different data)
-// and left OCU DTCs U001100/U120100 in this car's fault memory; this climate path does
-// neither. Once the battery-control unit (BCU) accepts the BAP climate command it and the
-// comfort/EV cluster sustain their own NM, so the wake is only held as a short bridge and
-// then released.
+// The battery-control commands wake the comfort bus with an NM frame from a SPARE (unused) node id
+// instead of impersonating the real OCU. On a car with a live OCU, sending the OCU's node-0x67 NM
+// frame (same id, different data) left DTCs U001100/U120100 in one developer's car; this path never
+// does. The frame uses the OCU's layout and its wake reason for the command (egolf/nm.h). Once the
+// battery-control unit (BCU) has answered, the car keeps the bus up itself (the gateway alone holds it
+// ~15 s after an active wake), so the wake is only held as a short bridge and then released.
 #define VWEGOLF_NM_WAKE_NODE       0x7D  // spare node id (verified unused in captures)
 #define VWEGOLF_BATCTRL_WAKE_SECS  20    // max seconds to sustain the NM-wake bridge
 #define VWEGOLF_BATCTRL_RETRY_SECS 2     // backstop: re-send a step only if its reply is lost this long
@@ -58,9 +58,9 @@
 // time (each is a separate arm+trigger), but this controller serializes the command SEQUENCES (one
 // arm+trigger in flight at a time; see BcOp) — they differ only in the arm's op bits and the
 // confirm. Owns ALL of that state so vehicle_vwegolf.cpp stays free of BCU logic — it
-// only forwards a per-second tick and two RX frames. Independent of the OCU 0x5A7 heartbeat
-// that vehicle_vwegolf.cpp uses for the body commands (mirror/lock/horn): this rides its own
-// spare-node NM wake and never touches m_ocu_active.
+// only forwards a per-second tick and two RX frames. Independent of the `wakeup` session and its
+// 0x5A7 frame that vehicle_vwegolf.cpp uses for the body commands (mirror/lock/horn): this rides
+// its own spare-node NM wake and never touches that session.
 //
 // EVENT-DRIVEN: the command is a small state machine advanced by the BCU's own BAP replies
 // on 0x17332510, NOT by blind per-tick re-sending. Command() arms the wake bridge and
@@ -213,6 +213,7 @@ class VWeGolfBatteryControl {
     // Abort an in-flight climate wake (e.g. `xvg offline`): release the NM bridge.
     void Abort() { m_phase = CP_IDLE; m_wake_hold = 0; }
 
+    // True while a command holds its NM wake (the vehicle's `wakeup` session then sends no NM of its own).
     bool WakeActive() const { return m_wake_hold > 0; }
 
  private:
@@ -261,7 +262,9 @@ class VWeGolfBatteryControl {
         CP_DONE,       // confirmed; NM bridge releasing
     };
 
-    void SendNmWake();
+    void SendNmWake();     // one NM frame with the command's wake request (m_nm)
+    void SendNmRelease();  // the last NM frame: wake request withdrawn
+    static vwegolf_nm::Reason NmReason(BcOp op, bool enable);  // the OCU's wake reason for a command
     bool TxFrame(const uint8_t* frame, uint8_t dlc);  // one BAP frame -> BCU command id (0x17332501)
     bool SendHandshake();   // channel-open GETs "19 42" + "19 41"
     bool SendProfileGet();  // GET ProfilesArray "19 59" (reply drives the arm)
@@ -434,6 +437,7 @@ class VWeGolfBatteryControl {
     uint8_t m_wake_hold     = 0;      // Ticker1 countdown for the NM-wake bridge (seconds)
     uint8_t m_phase_secs    = 0;      // seconds in the current phase (lost-reply backstop timer)
     uint8_t m_collect_secs  = 0;      // BC_TIMER_LIST: seconds spent collecting the timer broadcast
+    vwegolf_nm::Sender m_nm{VWEGOLF_NM_WAKE_NODE};  // NM wake frames of the in-flight command
 };
 
 #endif  // __VEHICLE_VWEGOLF_BAT_CTRL_H__

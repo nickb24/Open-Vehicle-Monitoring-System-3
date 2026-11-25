@@ -83,7 +83,7 @@ OvmsVehicleVWeGolf::OvmsVehicleVWeGolf() {
 
     OvmsCommand* cmd_vweg = MyCommandApp.RegisterCommand("xvg", "VW e-Golf controls");
     cmd_vweg->RegisterCommand("offline", "Stop sending OCU keepalive (diagnostic)", [this](...) {
-        m_ocu_active = false;
+        EndWakeSession("xvg offline", false);
         m_batctrl.Abort();  // also release any in-flight climate NM-wake bridge
         ESP_LOGI(TAG, "OCU keepalive stopped");
     });
@@ -245,13 +245,7 @@ void OvmsVehicleVWeGolf::IncomingFrameCan2(CAN_frame_t* p_frame) {
 
 void OvmsVehicleVWeGolf::IncomingFrameCan3(CAN_frame_t* p_frame) {
     m_bus_idle_ticks = 0;
-
-    // Send OCU keepalive at ~5Hz while active. VW OSEK NM requires keepalives at
-    // ~200ms intervals; Ticker1 alone (1Hz) is too slow for the ECU to stay in network.
-    // SendOcuHeartbeat self-throttles (180ms min) against TX queue overflow on bus bursts.
-    if (m_ocu_active) {
-        SendOcuHeartbeat();
-    }
+    if (p_frame->MsgID == bap::egolf::kCanIdStatus) m_kcan_bcu_rx++;  // `wakeup` waits for the BCU
 
     DecodeFrame(p_frame);
 }
@@ -763,6 +757,10 @@ void OvmsVehicleVWeGolf::DecodeFrame(CAN_frame_t* p_frame) {
             if (d[0] | d[1] | d[2] | d[3] | d[4] | d[5] | d[6] | d[7]) m_oem_ocu_idle_ticks = 0;
             break;
         }
+        case 0x17F00067:  // the OCU's KN frame, every 500 ms while it is awake
+        case 0x1B000067:  // NM from the OCU's node (OVMS never sends as node 0x67)
+            m_oem_ocu_idle_ticks = 0;
+            break;
         case 0x5CA:  // HV battery energy content. 11-bit, factor 50 Wh → kWh.
         {
             // Near-max raw value (upper 7 bits of d[2] all set) is a startup sentinel
@@ -1015,8 +1013,8 @@ void OvmsVehicleVWeGolf::Ticker1(uint32_t ticker) {
 
     bool bus_alive = m_bus_idle_ticks < VWEGOLF_BUS_TIMEOUT_SECS;
     bool just_went_idle = (m_bus_idle_ticks == VWEGOLF_BUS_TIMEOUT_SECS);
-    ESP_LOGV(TAG, "Ticker1: bus_idle=%u alive=%d ocu=%d", m_bus_idle_ticks, bus_alive,
-             m_ocu_active);
+    ESP_LOGV(TAG, "Ticker1: bus_idle=%u alive=%d wake=%d", m_bus_idle_ticks, bus_alive,
+             m_wake_session);
 
     // When the bus goes silent the car is asleep: clear the awake / drivable state as a
     // backstop in case the terminal frames stopped before signalling the off transition.
@@ -1042,36 +1040,26 @@ void OvmsVehicleVWeGolf::Ticker1(uint32_t ticker) {
         m_hv_active || StandardMetrics.ms_v_charge_inprogress->AsBool() ||
         StandardMetrics.ms_v_env_hvac->AsBool());
 
-    // Clear OCU node presence on either condition:
-    //   1. Bus went idle (no frames for VWEGOLF_BUS_TIMEOUT_SECS) — no one to hear us.
-    //   2. OEM OCU is present — it owns 0x5A7, our TX would collide on arbitration.
-    // Without (2), m_ocu_active stays set across an entire drive cycle whenever the
-    // bus never idles, and the next RX frame triggers a heartbeat that collides with
-    // the OEM OCU every time. Do NOT clear metrics — decoders own them; stale-expire
-    // handles freshness. (Clearing charge_inprogress here would falsely show "not
-    // charging" during CCS DC, which keeps KCAN silent while actively charging.)
-    bool oem_ocu_present = m_oem_ocu_idle_ticks < VWEGOLF_BUS_TIMEOUT_SECS;
-
-    if (m_ocu_active) {
-        if (m_ocu_session_secs < 255) m_ocu_session_secs++;
-        if (m_ocu_grace_secs < 255) m_ocu_grace_secs++;
-    }
-    bool grace_expired = m_ocu_grace_secs < 255 && m_ocu_grace_secs >= VWEGOLF_OCU_ACK_GRACE_SECS;
-    bool cap_expired = m_ocu_session_secs >= VWEGOLF_OCU_SESSION_CAP_SECS;
-
-    if (m_ocu_active && (just_went_idle || oem_ocu_present || grace_expired || cap_expired)) {
-        m_ocu_active = false;
-        const char* reason = just_went_idle    ? "KCAN idle"
-                             : oem_ocu_present ? "OEM OCU active"
-                             : grace_expired   ? "ACK grace expired"
-                                               : "session cap";
-        ESP_LOGI(TAG, "OCU presence cleared: %s", reason);
-    }
-
-    // Guard: only heartbeat when we've joined the bus and the bus has live traffic.
-    if (m_ocu_active && bus_alive) {
-        SendNmAlive();
-        SendOcuHeartbeat();
+    // `wakeup` session: once a second, the NM wake request (unless a battery-control command holds its
+    // own) and the 0x5A7 frame (not while the car's own OCU is present). Ends after
+    // VWEGOLF_WAKE_HOLD_SECS with a release frame, or when the bus has gone idle. Do NOT clear metrics
+    // here — decoders own them; stale-expire handles freshness. (Clearing charge_inprogress would
+    // falsely show "not charging" during CCS DC, which keeps KCAN silent while actively charging.)
+    if (m_wake_session) {
+        if (m_wake_secs < 255) m_wake_secs++;
+        if (just_went_idle) {
+            EndWakeSession("KCAN idle", false);
+        } else if (m_wake_secs >= VWEGOLF_WAKE_HOLD_SECS) {
+            EndWakeSession("hold time over", bus_alive);
+        } else if (bus_alive) {
+            if (!m_batctrl.WakeActive()) SendWakeNm(false);
+            if (m_oem_ocu_idle_ticks >= VWEGOLF_BUS_TIMEOUT_SECS) {
+                SendOcuHeartbeat();
+            } else if (!m_wake_ocu_noted) {
+                m_wake_ocu_noted = true;
+                ESP_LOGI(TAG, "Wake session: the car's OCU is active, no 0x5A7 from OVMS");
+            }
+        }
     }
 
     // Drive the climate controller's wake + retry-until-confirmed state machine. It is
@@ -1122,34 +1110,51 @@ OvmsVehicle::vehicle_command_t OvmsVehicleVWeGolf::CommandPanic() {
     return Success;
 }
 
-void OvmsVehicleVWeGolf::WakeKcanBus() {
-    ESP_LOGI(TAG, "WakeKcanBus: asserting dominant bits on KCAN");
+static uint32_t WakeNowMs() {
+    return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+}
 
-    // Reset the KCAN controller to clear any stuck frame from the TWAI HW TX FIFO.
-    // A stale heartbeat left from the prior session occupies the FIFO slot; on a sleeping
-    // bus it can never drain (no ACK), so the wake frame queues behind it and never
-    // produces dominant bits. Stop/Start preserves mode and speed.
-    m_can3->Reset();
+bool OvmsVehicleVWeGolf::WakeKcanBus() {
+    // Reset the KCAN controller to clear any stuck frame from its TX buffers. A stale frame left
+    // from the prior session occupies the slot; on a sleeping bus it can never drain (no ACK), so
+    // the wake frame queues behind it and never produces dominant bits. Stop/Start preserves mode
+    // and speed.
+    if (m_can3->Reset() != ESP_OK) {
+        ESP_LOGE(TAG, "Wakeup: could not restart the KCAN controller");
+        return false;
+    }
     vTaskDelay(pdMS_TO_TICKS(5));
 
-    uint8_t data[8] = {0x40, 0x00, 0x01, 0x1F, 0x00, 0x00, 0x00, 0x00};
-    m_can3->WriteExtended(0x17330301, 8, data, pdMS_TO_TICKS(50));
+    // NM wake request as the spare node, reason "status" (egolf/nm.h): 7D 00 41 87 44 00 00 00.
+    // The first frame on a sleeping bus is never acknowledged (the driver drops it once error-passive),
+    // but its retries wake the transceivers, so the same frame 50 ms later gets through.
+    ESP_LOGI(TAG, "Wakeup: NM wake as node 0x%02X", VWEGOLF_NM_WAKE_NODE);
+    m_wake_nm.Start(vwegolf_nm::REASON_STATUS, WakeNowMs());
+    SendWakeNm(false);
     vTaskDelay(pdMS_TO_TICKS(50));
+    SendWakeNm(false);
 
-    data[0] = 0x67;
-    data[1] = 0x10;
-    data[2] = 0x41;
-    data[3] = 0x84;
-    data[4] = 0x14;
-    data[5] = 0x00;
-    data[6] = 0x00;
-    data[7] = 0x00;
-    m_can3->WriteExtended(0x1B000067, 8, data, pdMS_TO_TICKS(50));
-    vTaskDelay(pdMS_TO_TICKS(100));
+    m_wake_secs = 0;
+    m_wake_ocu_noted = false;
+    m_wake_session = true;
+    return true;
+}
 
-    m_ocu_active = true;
-    m_ocu_session_secs = 0;
-    m_ocu_grace_secs = 255;
+void OvmsVehicleVWeGolf::SendWakeNm(bool release) {
+    uint8_t data[8];
+    if (release)
+        m_wake_nm.Release(WakeNowMs(), data);
+    else
+        m_wake_nm.Frame(WakeNowMs(), data);
+    m_can3->WriteExtended(m_wake_nm.Id(), 8, data, pdMS_TO_TICKS(50));
+}
+
+void OvmsVehicleVWeGolf::EndWakeSession(const char* why, bool release) {
+    if (!m_wake_session) return;
+    m_wake_session = false;
+    // Withdraw the wake request, as the OCU does, unless a battery-control command still holds it.
+    if (release && !m_batctrl.WakeActive()) SendWakeNm(true);
+    ESP_LOGI(TAG, "Wake session ended: %s", why);
 }
 
 OvmsVehicle::vehicle_command_t OvmsVehicleVWeGolf::CommandWakeup() {
@@ -1157,27 +1162,32 @@ OvmsVehicle::vehicle_command_t OvmsVehicleVWeGolf::CommandWakeup() {
         ESP_LOGI(TAG, "Wakeup: KCAN already active");
         return Success;
     }
-    WakeKcanBus();
-    return Success;
+    const uint32_t bcu_before = m_kcan_bcu_rx;
+    if (!WakeKcanBus()) return Fail;
+
+    // Report success only once the battery-control unit is heard on KCAN: other nodes also wake
+    // briefly from a wake frame that never got through.
+    for (int waited = 0;; waited += 100) {
+        if (m_kcan_bcu_rx != bcu_before) {
+            ESP_LOGI(TAG, "Wakeup: BCU answered within %d ms", waited + 100);
+            return Success;
+        }
+        if (waited >= VWEGOLF_WAKE_ANSWER_MS) break;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    ESP_LOGW(TAG, "Wakeup failed: no answer from the BCU within %d ms", VWEGOLF_WAKE_ANSWER_MS);
+    EndWakeSession("no answer", false);
+    return Fail;
 }
 
 void OvmsVehicleVWeGolf::SendOcuHeartbeat() {
-    // Hard gate: OEM OCU owns 0x5A7. If it's alive, our TX collides on arbitration
-    // every frame (identical ID) — TEC climbs on no-ACK until bus-off. Stand down
-    // until the OEM OCU has been silent for >= VWEGOLF_BUS_TIMEOUT_SECS.
+    // The OCU's 0x5A7 (Licht_Anf_01), sent once a second from Ticker1 during a `wakeup` session, like
+    // the OCU's own 1 s cycle. All zero unless a mirror / lock / horn request is pending.
+    // Hard gate: the car's OCU sends 0x5A7 too. Two senders with different data on one id cause bus
+    // errors, so stand down until the OEM OCU has been silent for >= VWEGOLF_BUS_TIMEOUT_SECS.
     if (m_oem_ocu_idle_ticks < VWEGOLF_BUS_TIMEOUT_SECS) {
         return;
     }
-
-    // Self-throttle: minimum 180 ms between sends regardless of caller (Ticker1,
-    // incoming-frame hook, or any future call site). Guards against TX queue overflow
-    // during NM wake bursts and ensures Ticker1 can't double-fire on top of the
-    // incoming-frame path.
-    uint32_t now = xTaskGetTickCount();
-    if ((now - m_last_heartbeat_tick) * portTICK_PERIOD_MS < 180) {
-        return;
-    }
-    m_last_heartbeat_tick = now;
 
     uint8_t tmp_u8 = 0;
 
@@ -1236,14 +1246,6 @@ void OvmsVehicleVWeGolf::SendOcuHeartbeat() {
     m_can3->WriteStandard(0x5A7, 8, data);
     ESP_LOGV(TAG, "Heartbeat 0x5A7: %02x %02x %02x %02x %02x %02x %02x %02x", data[0], data[1],
              data[2], data[3], data[4], data[5], data[6], data[7]);
-}
-
-void OvmsVehicleVWeGolf::SendNmAlive() {
-    // Ring drops silent nodes after a few cadences; a one-shot alive on wake survives
-    // long enough for warm-bus commands. The OEM 0x67 cadence is ~1.3 s (observed on-car),
-    // which Ticker1's 1 Hz tick matches.
-    uint8_t data[8] = {0x67, 0x10, 0x41, 0x84, 0x14, 0x00, 0x00, 0x00};
-    m_can3->WriteExtended(0x1B000067, 8, data);
 }
 
 OvmsVehicle::vehicle_command_t OvmsVehicleVWeGolf::CommandClimateControl(bool enable) {

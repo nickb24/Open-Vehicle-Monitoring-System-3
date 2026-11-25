@@ -179,13 +179,14 @@ void test_climate_command_kicks_nm_wake() {
     CHECK(result == Success, "CommandClimateControl(true) returns Success immediately");
 
     auto wake = ext_frames(kcan(v), NM_WAKE_ID);
-    CHECK(wake.size() == 1, "Command emits exactly one spare-node NM wake");
-    if (!wake.empty()) {
+    CHECK(wake.size() == 2, "Command emits the spare-node NM wake twice (the first is lost on a sleeping bus)");
+    if (wake.size() == 2) {
+        CHECK(memcmp(wake[0].data, wake[1].data, 8) == 0, "Both wake frames are identical");
         CHECK(wake[0].len == 8, "NM wake DLC = 8");
         CHECK(wake[0].data[0] == VWEGOLF_NM_WAKE_NODE, "NM wake byte0 = spare node 0x7D");
-        CHECK(wake[0].data[1] == 0x10 && wake[0].data[2] == 0x49 && wake[0].data[3] == 0x85 &&
-              wake[0].data[4] == 0x14,
-              "NM wake payload = 7D 10 49 85 14 ..");
+        static const uint8_t want[8] = {0x7D, 0x00, 0x41, 0x85, 0x24, 0x00, 0x00, 0x00};
+        CHECK(memcmp(wake[0].data, want, 8) == 0,
+              "NM wake = OCU layout, climate start: 7D 00 41 85 24 00 00 00");
     }
     // No BAP command yet — the BCU has not been heard.
     CHECK(ext_frames(kcan(v), BAP_CMD_ID).empty(), "No BAP command before the BCU is heard");
@@ -921,7 +922,11 @@ void test_list_profiles_readonly() {
     MyNotify = OvmsNotify{};
     auto* v = new OvmsVehicleVWeGolf();
 
+    // No Ticker1 call anywhere in this test: the read must complete with the tick stalled, as it is
+    // while an MQTT command blocks the network task (2026-11-24 15:36: the wake was never repeated).
     CHECK(v->test_batctrl().ListProfiles(), "ListProfiles() accepted (no command in flight)");
+    CHECK(ext_frames(kcan(v), NM_WAKE_ID).size() == 2,
+          "both wake frames sent by the command itself, before any tick");
     CHECK(v->test_batctrl().ListStatus() == VWeGolfBatteryControl::LIST_PENDING,
           "list state PENDING while the read is in flight");
     advance_to_profile_phase(v);   // wake -> handshake -> ack -> GET issued

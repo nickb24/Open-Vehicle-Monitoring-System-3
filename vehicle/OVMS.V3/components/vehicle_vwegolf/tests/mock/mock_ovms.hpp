@@ -26,7 +26,9 @@
 // FreeRTOS stubs (only the bits used in vehicle_vwegolf.cpp)
 // ---------------------------------------------------------------------------
 typedef uint32_t TickType_t;
-inline void vTaskDelay(TickType_t) {}
+// Optional test hook run on every vTaskDelay, e.g. to let the "car" answer while `wakeup` waits.
+extern std::function<void(TickType_t)> g_delay_hook;
+inline void vTaskDelay(TickType_t t) { if (g_delay_hook) g_delay_hook(t); }
 inline TickType_t pdMS_TO_TICKS(uint32_t ms) { return ms; }
 extern uint32_t g_tick_count;
 inline TickType_t xTaskGetTickCount() { return g_tick_count; }
@@ -80,7 +82,10 @@ struct canbus {
         return LogTx(true, id, len, data);
     }
     CAN_errorstate_t GetErrorState() { return error_state; }
-    esp_err_t Reset() { return ESP_OK; }
+    // Reset() result and call count, so tests can exercise a failed controller restart.
+    esp_err_t reset_result = ESP_OK;
+    int       reset_count  = 0;
+    esp_err_t Reset() { reset_count++; return reset_result; }
 
  private:
     esp_err_t LogTx(bool ext, uint32_t id, uint8_t len, uint8_t* data) {

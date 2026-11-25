@@ -236,7 +236,7 @@ bool VWeGolfBatteryControl::Begin(BcOp op, bool enable, uint16_t param) {
     // to bring up the comfort/EV cluster; the actual BAP command runs event-driven from
     // IncomingBapStatus as the BCU responds. The wake is held only as a short bridge in Ticker1
     // — once the BCU accepts the command it and the cluster sustain their own NM. No OCU
-    // impersonation (which risks the OCU-collision DTCs U001100/U120100 seen on this car).
+    // impersonation (which risks the OCU-collision DTCs U001100/U120100 seen on a car with an OCU).
     m_param         = (uint8_t)param;
     m_enable        = enable;
     // Auto-apply: a SetChargeCurrent issued WHILE a charge is running must re-fire the start after
@@ -262,8 +262,35 @@ bool VWeGolfBatteryControl::Begin(BcOp op, bool enable, uint16_t param) {
     m_phase         = CP_WAKE;
     m_phase_secs    = 0;
     m_wake_hold     = VWEGOLF_BATCTRL_WAKE_SECS;
-    SendNmWake();  // kick the wake now; Ticker1 sustains it; the BCU's first reply kicks off the BAP
+    m_nm.Start(NmReason(op, enable), BapNowMs());
+    // Kick the wake now. The first frame on a sleeping bus is never acknowledged (the driver drops it
+    // once error-passive), but its retries wake the transceivers, so the same frame 50 ms later gets
+    // through. Sending both here, not from Ticker1, keeps the wake independent of the tick: a command
+    // run over MQTT blocks the network task, and the tick with it, while it waits for its result.
+    // Ticker1 then sustains the wake; the BCU's first reply kicks off the BAP in the CAN RX path.
+    SendNmWake();
+    vTaskDelay(pdMS_TO_TICKS(50));
+    SendNmWake();
     return true;
+}
+
+vwegolf_nm::Reason VWeGolfBatteryControl::NmReason(BcOp op, bool enable) {
+    // The OCU's wake reason for the matching remote function. The OCU never wakes the car just to read
+    // profiles or timers, so the read-only lists use the reason of the matching change.
+    using namespace vwegolf_nm;
+    switch (op) {
+        case BC_CLIMATE:      return enable ? REASON_START_CLIMATE : REASON_STOP_CLIMATE;
+        case BC_CHARGE:       return enable ? REASON_START_CHARGE : REASON_STOP_CHARGE;
+        case BC_SET_CURRENT:  return REASON_SETTINGS;
+        case BC_LIST:
+        case BC_PROFILE_SET:  return REASON_PROFILES;
+        case BC_TIMER_LIST:
+        case BC_TIMER_SET:
+        case BC_TIMER_ENABLE: return REASON_TIMERS;
+        case BC_WINDOW_HEAT:
+        case BC_SEAT_HEAT:    return enable ? REASON_START_HEATING : REASON_STOP_HEATING;
+    }
+    return REASON_STATUS;
 }
 
 // ---------------------------------------------------------------------------
@@ -289,7 +316,7 @@ void VWeGolfBatteryControl::Ticker1(bool bus_alive) {
         return;
     }
 
-    SendNmWake();  // ~1 Hz, within the AUTOSAR NM timeout, to wake and hold the cluster
+    SendNmWake();  // ~1 Hz: repeats the (first, unacknowledged) wake frame and holds the bus
 
     m_phase_secs++;
 #if VWEGOLF_BATCTRL_RETRY_ENABLED
@@ -416,6 +443,7 @@ void VWeGolfBatteryControl::Ticker1(bool bus_alive) {
             const bool charge_op = m_op == BC_CHARGE || m_op == BC_SET_CURRENT;
             MyNotify.NotifyString("alert", charge_op ? "xvg.charge" : "xvg.climate", reason);
         }
+        if (bus_alive) SendNmRelease();  // withdraw the wake request, as the OCU does
         m_phase = CP_IDLE;
     }
 }
@@ -1184,16 +1212,17 @@ void VWeGolfBatteryControl::IncomingClimaEcuStatus(const CAN_frame_t* p_frame) {
 // ---------------------------------------------------------------------------
 
 void VWeGolfBatteryControl::SendNmWake() {
-    // AUTOSAR CAN-NM wake from a SPARE (unused) node id (id = 0x1B000000 + node), so it never
-    // impersonates the real OCU's node 0x67. Impersonating the OCU (this NM id and/or its 0x5A7
-    // heartbeat) collided with the car's live OCU and left DTCs U001100/U120100. The payload
-    // requests the comfort/EV partial-network cluster:
-    //   byte0 = source node id (spare)          byte1 = 0x10 CBV active-wakeup
-    //   byte2 = 0x49 = 0x40 charge | 0x08 climate PNC | 0x01 comfort baseline
-    //   byte3 = 0x85 = 0x84 (observed wake request) | 0x01 (Climatronic 0x46 PNC)
-    //   byte4 = 0x14 (observed wake request bits)
-    uint8_t data[8] = {VWEGOLF_NM_WAKE_NODE, 0x10, 0x49, 0x85, 0x14, 0x00, 0x00, 0x00};
-    m_bus->WriteExtended(0x1B000000u | VWEGOLF_NM_WAKE_NODE, 8, data);
+    // NM wake from the SPARE node id in the OCU's frame layout, with the command's wake reason
+    // (egolf/nm.h), e.g. 7D 00 41 85 24 00 00 00 for a climate start.
+    uint8_t data[8];
+    m_nm.Frame(BapNowMs(), data);
+    m_bus->WriteExtended(m_nm.Id(), 8, data);
+}
+
+void VWeGolfBatteryControl::SendNmRelease() {
+    uint8_t data[8];
+    m_nm.Release(BapNowMs(), data);
+    m_bus->WriteExtended(m_nm.Id(), 8, data);
 }
 
 bool VWeGolfBatteryControl::TxFrame(const uint8_t* frame, uint8_t dlc) {
