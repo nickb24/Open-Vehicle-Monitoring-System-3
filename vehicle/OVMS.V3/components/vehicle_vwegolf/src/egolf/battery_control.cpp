@@ -206,7 +206,7 @@ const ValueName kClimateStates[] = {
   {CS_RUNNING, "running", true},
   {CS_ABORT_NOT_IN_PARK, "aborted: not in park", false},
   {CS_ABORT_POWER_REDUCTION, "aborted: power reduction", false},
-  {CS_COMPLETED, "completed", false},
+  {CS_COMPLETED, "completed", true},  // [WIRE 2026-11-25: remote climate ended as the car was switched on]
 };
 // seatheaterWindowState uses a subset of the climateState numbers.
 const ValueName kHeaterStates[] = {
@@ -253,7 +253,7 @@ const ValueName kChargeStates[] = {
   {CHS_ABORT_DEVICE_ERROR, "aborted: device error", false},
   {CHS_ABORT_NO_SUPPLY, "aborted: power supply not available", false},
   {CHS_ABORT_NOT_IN_PARK, "aborted: not in park", false},
-  {CHS_COMPLETED, "completed", false},
+  {CHS_COMPLETED, "completed", true},  // [WIRE 2026-11-24: charge ended as the cable was pulled]
 };
 // ChargeState byte 8 high nibble, DSI numbering.
 const ValueName kChargeStartReasons[] = {

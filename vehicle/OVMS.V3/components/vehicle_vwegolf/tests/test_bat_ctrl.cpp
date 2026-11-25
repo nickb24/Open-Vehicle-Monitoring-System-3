@@ -2082,6 +2082,10 @@ void test_status_extra_fields() {
     CHECK(strcmp(s, "immediately") == 0, "start reason 5 = immediately (seen on the car)");
     chargeStartReasonName(3, s, sizeof(s));
     CHECK(strcmp(s, "timer 3 (unconfirmed)") == 0, "start reason 3 = timer 3 (unconfirmed: not seen yet)");
+    chargeStateName(CHS_COMPLETED, s, sizeof(s));
+    CHECK(strcmp(s, "completed") == 0, "charge state completed (seen on the car)");
+    climateStateName(CS_COMPLETED, s, sizeof(s));
+    CHECK(strcmp(s, "completed") == 0, "climate state completed (seen on the car)");
 
     Timer t;
     const uint8_t rec[8] = {0xff, 0xff, 0xff, 0x08, 0x1e, 0x3e, 0x01, 0x21};
