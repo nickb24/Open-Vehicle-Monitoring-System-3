@@ -151,7 +151,9 @@ Charge control only applies to the default settings in the car, not the user def
 This means:
 
 * Current limit does not apply by default if you have departure timers enabled because the car will not use the default settings.
-* The moment you use the charge control feature the car will switch to the default charge profile, charging it to 100% SoC
+* The moment you use the charge control feature the car will switch to the default charge profile (profile 0,
+  "Optionen") and charge immediately with its settings, including its charge limit. Where profile 0 sets no limit
+  (``xvg charge profile list`` shows ``-`` under TgtSoC), the car charges to 100% SoC
 * You cannot switch back to your departure timer via OVMS, press the delayed charging button on the charge port
 
 Furthermore to make it compatible with climate control:
