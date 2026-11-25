@@ -867,7 +867,6 @@ void VWeGolfBatteryControl::InitStatusMetrics() {
     m_ms_charge_remaining    = MyMetrics.InitInt("xvg.v.c.bcu.remaining", SM_STALE_MID, -1, Minutes);
     // ChargeState byte 8: what started the charge, and HV battery conditioning (firmware names).
     m_ms_charge_startreason  = MyMetrics.InitString("xvg.v.c.bcu.startreason", SM_STALE_MID, "no data");
-    m_ms_charge_batclimate   = MyMetrics.InitString("xvg.v.c.bcu.batteryclimate", SM_STALE_MID, "no data");
     m_ms_plug_state          = MyMetrics.InitString("xvg.v.c.plug.state", SM_STALE_MID, "no data");
     m_ms_plug_supply         = MyMetrics.InitString("xvg.v.c.plug.supply", SM_STALE_MID, "no data");
     m_ms_plug_lock           = MyMetrics.InitString("xvg.v.c.plug.lock", SM_STALE_MID, "no data");
@@ -1023,12 +1022,10 @@ void VWeGolfBatteryControl::HandleChargeState(const uint8_t* body, uint16_t len,
     m_ms_charge_state->SetValue(state);
     m_ms_charge_raw->SetValue(hex);
     m_ms_charge_remaining->SetValue(chs.remainingMin == 0xFFFF ? -1 : (int)chs.remainingMin);
-    char reason[40] = "-", batclimate[40] = "-";
+    char reason[40] = "-";
     if (chs.has8) {
         chargeStartReasonName(chs.startReason, reason, sizeof(reason));
-        batteryClimateStateName(chs.batteryClimateState, batclimate, sizeof(batclimate));
         m_ms_charge_startreason->SetValue(reason);
-        m_ms_charge_batclimate->SetValue(batclimate);
     }
 
     if (changed) {
@@ -1038,8 +1035,8 @@ void VWeGolfBatteryControl::HandleChargeState(const uint8_t* body, uint16_t len,
         if (chs.remainingMin != 0xFFFF) snprintf(remaining, sizeof(remaining), "%u min", (unsigned)chs.remainingMin);
         else snprintf(remaining, sizeof(remaining), "-");
         ESP_LOGI(TAG, "ChargeState 0x11 (%s): %s | mode: %s | state: %s | soc: %s | remaining: %s"
-                 " | start: %s | battery climate: %s",
-                 kind, hex, mode, state, soc, remaining, reason, batclimate);
+                 " | start: %s",
+                 kind, hex, mode, state, soc, remaining, reason);
     }
 
     if (prev != 0xFF && prev != chs.state && chargeStateIsAbort(chs.state) && !chargeStateIsAbort(prev)) {

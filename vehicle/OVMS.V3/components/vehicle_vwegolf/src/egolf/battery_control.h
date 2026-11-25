@@ -660,7 +660,7 @@ struct ChargeState {
   uint16_t remainingMin = 0xFFFF; // remaining charge time, minutes; 0xFFFF = none
   bool has8 = false;              // byte 8 present (the fields below are valid)
   uint8_t startReason = 0;        // [8] high nibble
-  uint8_t batteryClimateState = 0;  // [8] low nibble
+  uint8_t batteryClimateState = 0;  // [8] low nibble: HV battery conditioning; the e-Golf has none (not exposed)
 };
 inline bool decodeChargeState(const uint8_t* b, uint16_t len, ChargeState& out) {
   if (len < kChargeStateMinLen) return false;
@@ -711,7 +711,6 @@ size_t climateHeaterNames(uint8_t bits, char* out, size_t cap);
 size_t chargeModeName(uint8_t v, char* out, size_t cap);
 size_t chargeStateName(uint8_t v, char* out, size_t cap);
 size_t chargeStartReasonName(uint8_t v, char* out, size_t cap);
-size_t batteryClimateStateName(uint8_t v, char* out, size_t cap);
 size_t plugLockSetupName(uint8_t v, char* out, size_t cap);
 size_t plugLockStateName(uint8_t v, char* out, size_t cap);
 size_t plugSupplyName(uint8_t v, char* out, size_t cap);

@@ -412,7 +412,6 @@ class VWeGolfBatteryControl {
     OvmsMetricString* m_ms_charge_raw          = nullptr;  // xvg.v.c.bcu.raw
     OvmsMetricInt*    m_ms_charge_remaining    = nullptr;  // xvg.v.c.bcu.remaining (minutes, -1 = none)
     OvmsMetricString* m_ms_charge_startreason  = nullptr;  // xvg.v.c.bcu.startreason
-    OvmsMetricString* m_ms_charge_batclimate   = nullptr;  // xvg.v.c.bcu.batteryclimate
     OvmsMetricString* m_ms_plug_state          = nullptr;  // xvg.v.c.plug.state
     OvmsMetricString* m_ms_plug_supply         = nullptr;  // xvg.v.c.plug.supply
     OvmsMetricString* m_ms_plug_lock           = nullptr;  // xvg.v.c.plug.lock

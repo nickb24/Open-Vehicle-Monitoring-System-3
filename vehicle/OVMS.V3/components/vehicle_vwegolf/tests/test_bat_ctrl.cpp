@@ -2082,8 +2082,6 @@ void test_status_extra_fields() {
     CHECK(strcmp(s, "immediately") == 0, "start reason 5 = immediately (seen on the car)");
     chargeStartReasonName(3, s, sizeof(s));
     CHECK(strcmp(s, "timer 3 (unconfirmed)") == 0, "start reason 3 = timer 3 (unconfirmed: not seen yet)");
-    batteryClimateStateName(1, s, sizeof(s));
-    CHECK(strcmp(s, "off (unconfirmed)") == 0, "battery climate 1 = off (unconfirmed)");
 
     Timer t;
     const uint8_t rec[8] = {0xff, 0xff, 0xff, 0x08, 0x1e, 0x3e, 0x01, 0x21};
@@ -2096,8 +2094,7 @@ void test_status_extra_fields() {
     MyNotify = OvmsNotify{};
     auto* v = new OvmsVehicleVWeGolf();
     inject_bap_status(v, FUNC_CHARGE_STATE, {0x12, 0x4a, 0xaf, 0x00, 0xff, 0xff, 0x00, 0xff, 0x11});
-    CHECK(str_metric("xvg.v.c.bcu.startreason") == "timer 1" &&
-          str_metric("xvg.v.c.bcu.batteryclimate") == "off (unconfirmed)", "start reason / battery climate metrics");
+    CHECK(str_metric("xvg.v.c.bcu.startreason") == "timer 1", "start reason metric");
 
     inject_bap_status(v, FUNC_CLIMATE_STATE, std::vector<uint8_t>(cb, cb + sizeof(cb)));
     CHECK(bool_metric("xvg.v.env.heated_front_window") && bool_metric("xvg.v.env.heated_rear_window"),

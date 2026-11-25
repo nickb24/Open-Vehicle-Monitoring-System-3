@@ -265,13 +265,6 @@ const ValueName kChargeStartReasons[] = {
   {5, "immediately", true},  // [WIRE 2026-11-24: after `charge start`]
   {6, "push button", false},
 };
-// ChargeState byte 8 low nibble: HV battery conditioning.
-const ValueName kBatteryClimateStates[] = {
-  {0, "init", false},
-  {1, "off", false},
-  {2, "cooling", false},
-  {3, "heating", false},
-};
 const ValueName kPlugLockSetups[] = {
   {0, "unlocked", true},
   {1, "locked", true},     // [WIRE 2026-10-18: cable locked while charging]
@@ -315,9 +308,6 @@ size_t chargeStateName(uint8_t v, char* out, size_t cap) {
 }
 size_t chargeStartReasonName(uint8_t v, char* out, size_t cap) {
   return nameOf(kChargeStartReasons, VWE_N(kChargeStartReasons), v, out, cap);
-}
-size_t batteryClimateStateName(uint8_t v, char* out, size_t cap) {
-  return nameOf(kBatteryClimateStates, VWE_N(kBatteryClimateStates), v, out, cap);
 }
 size_t plugLockSetupName(uint8_t v, char* out, size_t cap) {
   return nameOf(kPlugLockSetups, VWE_N(kPlugLockSetups), v, out, cap);
