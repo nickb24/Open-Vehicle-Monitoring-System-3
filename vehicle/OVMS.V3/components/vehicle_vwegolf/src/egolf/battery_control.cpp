@@ -255,14 +255,14 @@ const ValueName kChargeStates[] = {
   {CHS_ABORT_NOT_IN_PARK, "aborted: not in park", false},
   {CHS_COMPLETED, "completed", false},
 };
-// ChargeState byte 8 high nibble, DSI numbering. 1 was read during a timer-1 charge, once.
+// ChargeState byte 8 high nibble, DSI numbering.
 const ValueName kChargeStartReasons[] = {
-  {0, "init", false},
-  {1, "timer 1", false},
-  {2, "timer 2", false},
+  {0, "init", true},         // [WIRE: every reading with no charge running]
+  {1, "timer 1", true},      // [WIRE 2026-10-18: charge for departure timer 1]
+  {2, "timer 2", true},      // [WIRE 2026-11-23/24: charges for departure timer 2]
   {3, "timer 3", false},
   {4, "timer 4", false},
-  {5, "immediately", false},
+  {5, "immediately", true},  // [WIRE 2026-11-24: after `charge start`]
   {6, "push button", false},
 };
 // ChargeState byte 8 low nibble: HV battery conditioning.

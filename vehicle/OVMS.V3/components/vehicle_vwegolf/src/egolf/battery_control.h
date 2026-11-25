@@ -640,6 +640,7 @@ inline bool heaterStateIsAbort(uint8_t s) {
 //   [8]   startReason (high nibble) | batteryClimateState (low nibble) [FW: baphandler]. Read 0x01 idle
 //         and 0x11 during a timer-1 charge [WIRE 2026-10-18]: startReason 1 fits the DSI enum (1 = timer
 //         1, 5 = immediately), not the tracker reading "1 = immediate", so the DSI names are used.
+//         Confirmed [WIRE 2026-11-24]: 0x21 during timer-2 charges, 0x51 after `charge start`.
 constexpr uint16_t kChargeStateMinLen = 2;
 constexpr uint16_t kChargeStateLen = 9;
 

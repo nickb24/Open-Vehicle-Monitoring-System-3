@@ -2077,7 +2077,11 @@ void test_status_extra_fields() {
     CHECK(decodeChargeState(shortCs, sizeof(shortCs), chs) && !chs.has8, "no byte 8 -> has8 false");
     char s[48];
     chargeStartReasonName(1, s, sizeof(s));
-    CHECK(strcmp(s, "timer 1 (unconfirmed)") == 0, "start reason 1 = timer 1 (unconfirmed)");
+    CHECK(strcmp(s, "timer 1") == 0, "start reason 1 = timer 1 (seen on the car)");
+    chargeStartReasonName(5, s, sizeof(s));
+    CHECK(strcmp(s, "immediately") == 0, "start reason 5 = immediately (seen on the car)");
+    chargeStartReasonName(3, s, sizeof(s));
+    CHECK(strcmp(s, "timer 3 (unconfirmed)") == 0, "start reason 3 = timer 3 (unconfirmed: not seen yet)");
     batteryClimateStateName(1, s, sizeof(s));
     CHECK(strcmp(s, "off (unconfirmed)") == 0, "battery climate 1 = off (unconfirmed)");
 
@@ -2092,7 +2096,7 @@ void test_status_extra_fields() {
     MyNotify = OvmsNotify{};
     auto* v = new OvmsVehicleVWeGolf();
     inject_bap_status(v, FUNC_CHARGE_STATE, {0x12, 0x4a, 0xaf, 0x00, 0xff, 0xff, 0x00, 0xff, 0x11});
-    CHECK(str_metric("xvg.v.c.bcu.startreason") == "timer 1 (unconfirmed)" &&
+    CHECK(str_metric("xvg.v.c.bcu.startreason") == "timer 1" &&
           str_metric("xvg.v.c.bcu.batteryclimate") == "off (unconfirmed)", "start reason / battery climate metrics");
 
     inject_bap_status(v, FUNC_CLIMATE_STATE, std::vector<uint8_t>(cb, cb + sizeof(cb)));
