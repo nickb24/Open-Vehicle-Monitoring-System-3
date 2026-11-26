@@ -902,6 +902,14 @@ void VWeGolfBatteryControl::HandleClimateState(const uint8_t* body, uint16_t len
         if (changed) ESP_LOGW(TAG, "ClimateState 0x12 (%s): %s (short: %u bytes, ignored)", kind, hex, (unsigned)len);
         return;
     }
+    // "Power reduction" with the climating mode bit still set is a running climate at reduced power: in
+    // every case seen on the car the mode stayed climating + heating and the car kept heating, whether
+    // the BCU reported it once for half a second, flipped between it and "running" every few seconds
+    // for minutes, or held it for over a minute. So it counts as running for v.e.hvac, the state metric
+    // and the abort notification; the log and the raw metric keep the reported value.
+    const bool reduced = cs.state == CS_ABORT_POWER_REDUCTION && (cs.mode & CM_CLIMATING) != 0;
+    const uint8_t climate = reduced ? (uint8_t)CS_RUNNING : cs.state;
+
     char state[48], hstate[48], mode[128], heaters[160];
     climateStateName(cs.state, state, sizeof(state));
     heaterStateName(cs.heaterState, hstate, sizeof(hstate));
@@ -910,11 +918,17 @@ void VWeGolfBatteryControl::HandleClimateState(const uint8_t* body, uint16_t len
 
     const uint8_t prev = m_cs_state;
     const uint8_t hprev = m_hs_state;
-    m_cs_state = cs.state;
+    m_cs_state = climate;
     m_hs_state = cs.heaterState;
     m_cs_age = 0;
 
-    m_ms_climate_state->SetValue(state);
+    if (reduced) {
+        char running[48];
+        climateStateName(climate, running, sizeof(running));
+        m_ms_climate_state->SetValue(running);
+    } else {
+        m_ms_climate_state->SetValue(state);
+    }
     m_ms_climate_heaterstate->SetValue(hstate);
     m_ms_climate_mode->SetValue(mode);
     m_ms_climate_heaters->SetValue(heaters);
@@ -924,7 +938,7 @@ void VWeGolfBatteryControl::HandleClimateState(const uint8_t* body, uint16_t len
     StandardMetrics.ms_v_env_heating->SetValue((cs.mode & CM_HEATING) != 0);
     StandardMetrics.ms_v_env_cooling->SetValue((cs.mode & CM_COOLING) != 0);
     if (BapClimateAuthoritative())
-        StandardMetrics.ms_v_env_hvac->SetValue(cs.state == CS_RUNNING);
+        StandardMetrics.ms_v_env_hvac->SetValue(climate == CS_RUNNING);
 
     if (changed) {
         // Bytes 1-4 (firmware layout, unverified: byte 1 has read 0 even with climate running).
@@ -937,15 +951,16 @@ void VWeGolfBatteryControl::HandleClimateState(const uint8_t* body, uint16_t len
         } else
             snprintf(temp, sizeof(temp), "raw %u unit %u", (unsigned)cs.temperatureRaw,
                      (unsigned)cs.temperatureUnit);
-        ESP_LOGI(TAG, "ClimateState 0x12 (%s): %s | climate: %s | seat/window: %s | mode: %s | heaters: %s"
+        ESP_LOGI(TAG, "ClimateState 0x12 (%s): %s | climate: %s%s | seat/window: %s | mode: %s | heaters: %s"
                  " | temp: %s | time raw: %u",
-                 kind, hex, state, hstate, mode, heaters, temp, (unsigned)cs.climatingTimeRaw);
+                 kind, hex, state, reduced ? " (still climating)" : "", hstate, mode, heaters, temp,
+                 (unsigned)cs.climatingTimeRaw);
     }
 
     // Say why climate stopped or never started: the reasons the head unit shows popups for, and the
     // rest of the abort values. Same for the BCU's separate seat / window heating state machine (low
     // nibble of byte 5), where a value not defined for it ("unknown (N)") is only logged (above).
-    HoldAbort(m_cs_abort, false, prev, cs.state);
+    HoldAbort(m_cs_abort, false, prev, climate);
     HoldAbort(m_hs_abort, true, hprev, cs.heaterState);
 }
 

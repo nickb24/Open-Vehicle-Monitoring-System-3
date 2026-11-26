@@ -387,12 +387,12 @@ class VWeGolfBatteryControl {
     bap::AssemblerT<128, 4> m_fcan_asm;    // FCAN copy of the BCU stream (GetAll = 79 bytes)
     struct StatusSeen { uint8_t raw[12]; uint8_t len; };
     StatusSeen m_status_seen[3]   = {};
-    uint8_t  m_cs_state           = 0xFF;  // last climateState
+    uint8_t  m_cs_state           = 0xFF;  // last climateState ("power reduction" while climating = running)
     uint8_t  m_hs_state           = 0xFF;  // last seatheaterWindowState (resets on sleep like m_cs_state)
     uint8_t  m_cs_age             = 0xFF;  // seconds since the last ClimateState (saturates at 255)
-    // The BCU reported "power reduction" for ~2 s in a running climate session, then "running" again
-    // [WIRE]; climate kept running. A held abort that turns back into "running" is only
-    // logged. Longer than one ClimateState heartbeat (~13 s), so the BCU has repeated the state.
+    // An abort value is notified only if the state does not turn back into "running" within this time;
+    // one that does is only logged. Longer than one ClimateState heartbeat (~13 s), so the BCU has
+    // repeated the state.
     static constexpr uint8_t kAbortHoldSecs = 15;
     HeldAbort m_cs_abort;                  // climate state machine
     HeldAbort m_hs_abort;                  // seat / window heating state machine

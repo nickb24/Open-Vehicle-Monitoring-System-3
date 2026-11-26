@@ -1355,32 +1355,33 @@ void test_heater_unknown_state_no_alert() {
     delete v;
 }
 
-// The BCU reported "power reduction" for ~2 s in a running climate session, then "running" again,
-// while climate kept running [WIRE]. An abort that turns back
-// into running within the 15 s hold is only logged; one that stays is notified; the driver getting
-// in drops it; a later abort value replaces the held one.
+// A climate abort value is held 15 s: one that turns back into running within that time is only
+// logged; one that stays is notified; the driver getting in drops it; a later abort value replaces the
+// held one. ("Power reduction" without the climating mode bit is used as the abort here; with the bit
+// it means climate still runs, see test_climate_power_reduction.)
 void test_climate_abort_held() {
     printf("\ntest_climate_abort_held\n");
     g_metrics = MetricStore{};
     MyNotify = OvmsNotify{};
     auto* v = new OvmsVehicleVWeGolf();
     const std::vector<uint8_t> running  = {0x05, 0x00, 0x00, 0x0a, 0x00, 0xcb, 0x00};  // [WIRE]
-    const std::vector<uint8_t> powerRed = {0x05, 0x00, 0x00, 0x0a, 0x00, 0xeb, 0x00};  // [WIRE]
+    const std::vector<uint8_t> powerRed = {0x00, 0x00, 0x00, 0x0a, 0x00, 0xeb, 0x00};  // not climating
     const uint8_t F = bap::egolf::FUNC_CLIMATE_STATE;
 
     inject_bap_status(v, F, running);
     inject_bap_status(v, F, powerRed);
     CHECK(str_metric("xvg.v.env.climate.state") == "aborted: power reduction",
-          "the metric shows the power reduction at once");
+          "the metric shows the abort at once");
+    CHECK(!hvac_on(), "abort -> v.e.hvac off");
     tick_secs(v, 2);
     inject_bap_status(v, F, running);
     tick_secs(v, 20);
-    CHECK(MyNotify.count == 0, "running -> power reduction -> running 2 s later: no notification");
+    CHECK(MyNotify.count == 0, "running -> abort -> running 2 s later: no notification");
 
     inject_bap_status(v, F, powerRed);
     tick_secs(v, 15);
     CHECK(MyNotify.count == 1 && MyNotify.last_value == "Climate stopped: aborted: power reduction",
-          "power reduction that stays 15 s: notified");
+          "abort that stays 15 s: notified");
 
     inject_bap_status(v, F, running);
     inject_bap_status(v, F, powerRed);
@@ -1404,6 +1405,59 @@ void test_climate_abort_held() {
     inject_bap_status(v, F, {0x00, 0x00, 0x00, 0x0a, 0x00, 0xbc, 0x00});
     tick_secs(v, 20);
     CHECK(MyNotify.count == 2, "heating running -> device error -> running: no notification");
+
+    delete v;
+}
+
+// "Power reduction" with the climating mode bit still set: climate keeps running at reduced power
+// (seen on the car: flipping with "running" every few seconds for minutes, and held for 21 s and 89 s,
+// mode climating + heating throughout). v.e.hvac and the state metric stay "running", no notification;
+// the raw metric keeps the reported bytes.
+void test_climate_power_reduction() {
+    printf("\ntest_climate_power_reduction\n");
+    g_metrics = MetricStore{};
+    MyNotify = OvmsNotify{};
+    auto* v = new OvmsVehicleVWeGolf();
+    const std::vector<uint8_t> running = {0x05, 0x00, 0x00, 0x0a, 0x00, 0xcb, 0x00};  // [WIRE]
+    const std::vector<uint8_t> reduced = {0x05, 0x00, 0x00, 0x0a, 0x00, 0xeb, 0x00};  // [WIRE]
+    const uint8_t F = bap::egolf::FUNC_CLIMATE_STATE;
+
+    inject_bap_status(v, F, running);
+    CHECK(hvac_on(), "running -> v.e.hvac on");
+
+    // Flipping: power reduction for ~1 s, running for a few seconds, many times.
+    bool hvac_stayed_on = true, state_stayed_running = true;
+    for (int i = 0; i < 30; i++) {
+        inject_bap_status(v, F, reduced);
+        if (!hvac_on()) hvac_stayed_on = false;
+        if (str_metric("xvg.v.env.climate.state") != "running") state_stayed_running = false;
+        tick_secs(v, 1);
+        inject_bap_status(v, F, running);
+        tick_secs(v, 4);
+    }
+    CHECK(hvac_stayed_on, "30 power reductions while climating: v.e.hvac stays on");
+    CHECK(state_stayed_running, "30 power reductions while climating: state metric stays 'running'");
+
+    // Held for 89 s: the BCU repeats it in its ~13 s heartbeat, the bus stays awake (clima ECU frames).
+    auto ecu_on = make_kcan_frame(v, 0x5EA, {0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00});
+    inject_bap_status(v, F, reduced);
+    CHECK(str_metric("xvg.v.env.climate.raw") == "05 00 00 0a 00 eb 00", "the raw metric keeps the reported value");
+    for (int s = 1; s <= 89; s++) {
+        v->IncomingFrameCan3(&ecu_on);
+        tick_secs(v, 1);
+        if (s % 13 == 0) inject_bap_status(v, F, reduced);
+    }
+    CHECK(hvac_on() && str_metric("xvg.v.env.climate.state") == "running", "89 s of power reduction: still running");
+    inject_bap_status(v, F, running);
+    tick_secs(v, 20);
+    CHECK(MyNotify.count == 0, "no notification for any power reduction while climating");
+
+    // The real end of the session still behaves as before.
+    inject_bap_status(v, F, reduced);
+    inject_bap_status(v, F, {0x05, 0x00, 0x00, 0x0a, 0x00, 0xfb, 0x00});  // completed
+    CHECK(!hvac_on() && str_metric("xvg.v.env.climate.state") == "completed", "completed after a reduction -> off");
+    tick_secs(v, 20);
+    CHECK(MyNotify.count == 0, "completed: no notification");
 
     delete v;
 }
@@ -2425,6 +2479,7 @@ void test_bat_ctrl_all() {
     test_status_abort_notifications();
     test_heater_unknown_state_no_alert();
     test_climate_abort_held();
+    test_climate_power_reduction();
     test_bap_reassembler_timeout();
     test_status_from_getall_and_sleep();
     test_fcan_charging_fallback();
