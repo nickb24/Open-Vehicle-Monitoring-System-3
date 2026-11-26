@@ -1370,7 +1370,7 @@ void test_climate_abort_held() {
 
     inject_bap_status(v, F, running);
     inject_bap_status(v, F, powerRed);
-    CHECK(str_metric("xvg.v.env.climate.state") == "aborted: power reduction (unconfirmed)",
+    CHECK(str_metric("xvg.v.env.climate.state") == "aborted: power reduction",
           "the metric shows the power reduction at once");
     tick_secs(v, 2);
     inject_bap_status(v, F, running);
@@ -1379,7 +1379,7 @@ void test_climate_abort_held() {
 
     inject_bap_status(v, F, powerRed);
     tick_secs(v, 15);
-    CHECK(MyNotify.count == 1 && MyNotify.last_value == "Climate stopped: aborted: power reduction (unconfirmed)",
+    CHECK(MyNotify.count == 1 && MyNotify.last_value == "Climate stopped: aborted: power reduction",
           "power reduction that stays 15 s: notified");
 
     inject_bap_status(v, F, running);
@@ -2081,11 +2081,15 @@ void test_status_extra_fields() {
     chargeStartReasonName(5, s, sizeof(s));
     CHECK(strcmp(s, "immediately") == 0, "start reason 5 = immediately (seen on the car)");
     chargeStartReasonName(3, s, sizeof(s));
-    CHECK(strcmp(s, "timer 3 (unconfirmed)") == 0, "start reason 3 = timer 3 (unconfirmed: not seen yet)");
+    CHECK(strcmp(s, "timer 3") == 0, "start reason 3 = timer 3 (seen on the car)");
+    chargeStartReasonName(6, s, sizeof(s));
+    CHECK(strcmp(s, "push button (unconfirmed)") == 0, "start reason 6 = push button (unconfirmed: not seen yet)");
     chargeStateName(CHS_COMPLETED, s, sizeof(s));
     CHECK(strcmp(s, "completed") == 0, "charge state completed (seen on the car)");
     climateStateName(CS_COMPLETED, s, sizeof(s));
     CHECK(strcmp(s, "completed") == 0, "climate state completed (seen on the car)");
+    climateStateName(CS_ABORT_POWER_REDUCTION, s, sizeof(s));
+    CHECK(strcmp(s, "aborted: power reduction") == 0, "climate state power reduction (seen on the car)");
 
     Timer t;
     const uint8_t rec[8] = {0xff, 0xff, 0xff, 0x08, 0x1e, 0x3e, 0x01, 0x21};

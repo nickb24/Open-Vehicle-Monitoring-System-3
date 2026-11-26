@@ -205,7 +205,8 @@ const ValueName kClimateStates[] = {
   {CS_IDLE, "idle", true},
   {CS_RUNNING, "running", true},
   {CS_ABORT_NOT_IN_PARK, "aborted: not in park", false},
-  {CS_ABORT_POWER_REDUCTION, "aborted: power reduction", false},
+  {CS_ABORT_POWER_REDUCTION, "aborted: power reduction", true},  // [WIRE 2026-11-24 + 11-25: for 0.5-2 s,
+                                                                 //  climate kept running]
   {CS_COMPLETED, "completed", true},  // [WIRE 2026-11-25: remote climate ended as the car was switched on]
 };
 // seatheaterWindowState uses a subset of the climateState numbers.
@@ -260,7 +261,7 @@ const ValueName kChargeStartReasons[] = {
   {0, "init", true},         // [WIRE: every reading with no charge running]
   {1, "timer 1", true},      // [WIRE 2026-10-18: charge for departure timer 1]
   {2, "timer 2", true},      // [WIRE 2026-11-23/24: charges for departure timer 2]
-  {3, "timer 3", false},
+  {3, "timer 3", true},      // [WIRE 2026-11-25: 0x31 while departure timer 3 was set in the car]
   {4, "timer 4", false},
   {5, "immediately", true},  // [WIRE 2026-11-24: after `charge start`]
   {6, "push button", false},
