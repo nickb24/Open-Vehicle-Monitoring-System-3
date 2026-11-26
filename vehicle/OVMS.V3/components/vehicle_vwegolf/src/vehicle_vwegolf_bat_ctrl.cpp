@@ -245,6 +245,8 @@ bool VWeGolfBatteryControl::Begin(BcOp op, bool enable, uint16_t param) {
     m_apply         = (op == BC_SET_CURRENT) && StandardMetrics.ms_v_charge_inprogress->AsBool();
     m_confirmed     = false;
     m_refused       = false;
+    m_trigger_answered = false;
+    m_heat_missing  = 0;
     m_processing    = false;
     m_error         = false;
     m_tx_fail       = false;
@@ -377,12 +379,14 @@ void VWeGolfBatteryControl::Ticker1(bool bus_alive) {
                 // auto-apply past its re-trigger) is waiting on the 49 58 -> re-fire the trigger. Never
                 // re-arm a climate/charge start (that resets the BCU's spin-up). A trigger the BCU
                 // answers with Processing (39 58) is not re-sent: each Processing restarts this backstop.
+                // Nor is a seat / window heating trigger the BCU has answered: it now waits for the
+                // heater state, and every trigger is another start attempt.
                 if (isTimerOp()) {
                     if (m_timer_write_record) SendTimerRecord();
                     SendTimerMask(m_timer_target_mask);
                 } else if (m_op == BC_PROFILE_SET) SendProfileSetWrite();  // re-send the field write
                 else if (m_op == BC_SET_CURRENT && !m_apply) SendArm();
-                else SendTrigger(m_enable);
+                else if (!(isHeatOp() && m_trigger_answered)) SendTrigger(m_enable);
                 break;
             default:  // CP_WAKE: keep NM-waking until the BCU is heard; CP_DONE: nothing
                 break;
@@ -421,6 +425,16 @@ void VWeGolfBatteryControl::Ticker1(bool bus_alive) {
         if (m_confirmed) {
             ESP_LOGI(TAG, "%s %s confirmed — releasing NM, cluster self-sustains", what,
                      (isCliOp() || m_op == BC_SET_CURRENT) ? "" : (m_enable ? "ON" : "OFF"));
+            if (isHeatOp() && m_enable && m_heat_missing) {
+                // Only some of the requested heaters started (e.g. the car drops the windscreen).
+                char on[96], off[96], msg[224];
+                bap::egolf::climateHeaterNames(HeatBits() & (uint8_t)~m_heat_missing, on, sizeof(on));
+                bap::egolf::climateHeaterNames(m_heat_missing, off, sizeof(off));
+                snprintf(msg, sizeof(msg), "%s on: %s; not started by the car: %s",
+                         m_op == BC_WINDOW_HEAT ? "Window heating" : "Seat heating", on, off);
+                ESP_LOGW(TAG, "%s", msg);
+                MyNotify.NotifyString("info", "xvg.climate", msg);
+            }
         } else if (isCliOp()) {
             // Console read/write op: the CLI command reports the failure to its own writer, so don't
             // push a user notification (climate/charge notify because they're remote fire-and-forget).
@@ -434,6 +448,9 @@ void VWeGolfBatteryControl::Ticker1(bool bus_alive) {
                 m_refused   ? "not started by the car (it processed the start and reported it failed)"
                 : m_error   ? "rejected by the battery control unit"
                 : m_tx_fail ? "CAN transmit error (try 'can can3 reset')"
+                : (isHeatOp() && m_trigger_answered)
+                            ? (m_enable ? "not started by the car (the heater did not come on)"
+                                        : "not stopped by the car (the heater is still on)")
                 : m_processing ? "the car was still processing it when OVMS stopped waiting"
                 : !m_have_profile0
                             ? "could not read the vehicle's profile (no response)"
@@ -565,11 +582,15 @@ void VWeGolfBatteryControl::IncomingBapStatus(const CAN_frame_t* p_frame) {
     }
 
     if (opmode) {
-        // The "49 58" echo confirms a climate/charge/heat START/STOP, OR a SetChargeCurrent auto-apply
+        // The "49 58" echo confirms a climate/charge START/STOP, OR a SetChargeCurrent auto-apply
         // (which re-fired the start). A write-only SET_CURRENT has no trigger and confirms on its
         // write echo instead (array handler below). Match the flag to the request.
         const bool started_op = isTriggerOp() || (m_op == BC_SET_CURRENT && m_apply);
-        if (started_op && m_phase == CP_CONFIRM && (el.body[0] != 0) == m_enable) {
+        if (isHeatOp() && m_phase == CP_CONFIRM && (el.body[0] != 0) == m_enable) {
+            // Seat / window heating: the echo only shows that the trigger arrived (no re-send); the
+            // heater state in ClimateState confirms it (HeatConfirmMaybe).
+            m_trigger_answered = true;
+        } else if (started_op && m_phase == CP_CONFIRM && (el.body[0] != 0) == m_enable) {
             m_confirmed = true;
             m_phase = CP_DONE;
             if (m_wake_hold > 2) m_wake_hold = 2;  // release soon, small grace
@@ -962,6 +983,43 @@ void VWeGolfBatteryControl::HandleClimateState(const uint8_t* body, uint16_t len
     // nibble of byte 5), where a value not defined for it ("unknown (N)") is only logged (above).
     HoldAbort(m_cs_abort, false, prev, climate);
     HoldAbort(m_hs_abort, true, hprev, cs.heaterState);
+
+    HeatConfirmMaybe(cs.heaterState, cs.heaters);
+}
+
+uint8_t VWeGolfBatteryControl::HeatBits() const {
+    using namespace bap::egolf;
+    if (m_op == BC_WINDOW_HEAT)
+        return (uint8_t)(((m_param & PO2_WINDOW_HEATER_FRONT) ? CH_WINDOW_FRONT : 0) |
+                         ((m_param & PO2_WINDOW_HEATER_REAR) ? CH_WINDOW_REAR : 0));
+    if (m_op == BC_SEAT_HEAT)
+        return (uint8_t)(((m_param & PO_SEAT_FL) ? CH_SEAT_FL : 0) | ((m_param & PO_SEAT_FR) ? CH_SEAT_FR : 0));
+    return 0;
+}
+
+void VWeGolfBatteryControl::HeatConfirmMaybe(uint8_t heaterState, uint8_t heaters) {
+    using namespace bap::egolf;
+    if (!isHeatOp() || m_phase != CP_CONFIRM || m_confirmed) return;
+    const uint8_t want = HeatBits();
+    const bool running = heaterState == CS_RUNNING;
+    if (m_enable) {
+        // Start: the heater state machine runs with at least one requested heater on. Heater bits while
+        // the heater state is not running were seen with the ignition on (the car's own switches), so
+        // the bits alone don't count.
+        if (!running || (heaters & want) == 0) return;
+        m_heat_missing = want & (uint8_t)~heaters;
+        char names[96];
+        climateHeaterNames(heaters & want, names, sizeof(names));
+        ESP_LOGI(TAG, "%s ON: heater state running (%s)", OpName(), names);
+    } else {
+        // Stop: none of the requested heaters runs any more.
+        if (running && (heaters & want) != 0) return;
+        ESP_LOGI(TAG, "%s OFF: heater state %u, heaters 0x%02x", OpName(), (unsigned)heaterState,
+                 (unsigned)heaters);
+    }
+    m_confirmed = true;
+    m_phase = CP_DONE;
+    if (m_wake_hold > 2) m_wake_hold = 2;  // release soon, small grace
 }
 
 void VWeGolfBatteryControl::HoldAbort(HeldAbort& h, bool heater, uint8_t prev, uint8_t now) {

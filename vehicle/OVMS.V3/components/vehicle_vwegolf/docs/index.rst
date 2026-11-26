@@ -130,6 +130,9 @@ Cabin Climate Control
   remote control: ``xvg windowheat on`` / ``off`` heats the windscreen and rear window, on its own or while
   climate is running. ``xvg windowheat on|off front`` or ``rear`` switches one window only (experimental; the
   car's own remote control always switches both)
+* Window and seat heating commands count as done only once the car reports the heater running (for ``off``: no
+  longer running); otherwise they fail with "not started by the car". If the car starts only some of the
+  requested heaters, an info notification names the ones it did not start
 * Every climate start clears any window heating option stored in the car. The former
   ``xvg charge profile set 0 frontwindow`` setting has been removed
 * With window heating included in a climate start, the windscreen only heated below 4 °C outside, as set in the

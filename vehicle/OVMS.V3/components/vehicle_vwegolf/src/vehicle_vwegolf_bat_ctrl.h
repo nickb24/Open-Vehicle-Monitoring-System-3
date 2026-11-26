@@ -244,10 +244,19 @@ class VWeGolfBatteryControl {
     bool Busy() const { return m_phase != CP_IDLE && m_phase != CP_DONE; }
     // Refuse a remote command (climate / charge / heat) while another is in flight: log + notify.
     bool RefuseBusy(const char* what, const char* channel);
-    // Ops that arm profile 0 and fire the OperationMode trigger, confirmed by the 49 58 echo.
+    // Ops that arm profile 0 and fire the OperationMode trigger. Climate and charge are confirmed by the
+    // 49 58 echo; seat / window heating by the ClimateState heater state (see HeatConfirmMaybe).
     bool isTriggerOp() const {
         return m_op == BC_CLIMATE || m_op == BC_CHARGE || m_op == BC_WINDOW_HEAT || m_op == BC_SEAT_HEAT;
     }
+    bool isHeatOp() const { return m_op == BC_WINDOW_HEAT || m_op == BC_SEAT_HEAT; }
+    // Seat / window heating: the ClimateState heater bits (byte 6) of the heaters the command asks for.
+    uint8_t HeatBits() const;
+    // Seat / window heating in CP_CONFIRM, on each ClimateState: confirm a start once the seat / window
+    // heater state runs with at least one requested heater on, a stop once none of them runs any more.
+    // The 49 58 echo can't confirm these: during climate the BCU answered a windscreen start with 01 at
+    // once although no heater came on. The OCU confirms them from the heater state too.
+    void HeatConfirmMaybe(uint8_t heaterState, uint8_t heaters);
 
     // Command progress. The BCU's replies advance it; Ticker1 only holds the wake + backstops.
     enum ClimatePhase : uint8_t {
@@ -258,7 +267,8 @@ class VWeGolfBatteryControl {
         CP_PROFILE,    // ON: requested the profile array, waiting to read + arm profile 0
         CP_ARM_WAIT,   // arm write sent, waiting for its "49 59 bx" echo BEFORE the trigger — else the
                        // trigger races the (multi-frame) write and runs the STALE profile-0 op
-        CP_CONFIRM,    // trigger sent, waiting for the BCU's "49 58 <flag>" confirmation
+        CP_CONFIRM,    // trigger sent, waiting for the BCU's "49 58 <flag>" confirmation (seat / window
+                       // heating: for the heater state in ClimateState)
         CP_DONE,       // confirmed; NM bridge releasing
     };
 
@@ -428,9 +438,11 @@ class VWeGolfBatteryControl {
     bool    m_arm_skipped   = false;  // SendArm() skipped the write (op already correct) -> no echo coming
     bool    m_apply         = false;  // BC_SET_CURRENT while charging: re-fire the start after the write
                                       // so the RUNNING charge picks up the new current (else it ignores it)
-    bool    m_confirmed     = false;  // BCU echoed "49 58 <flag>" matching the request
+    bool    m_confirmed     = false;  // command done (49 58 echo, write echo, or the heater state for heating)
     bool    m_processing    = false;  // BCU sent Processing "39 58" for our trigger (CP_CONFIRM)
     bool    m_refused       = false;  // a START was processed and then reported failed (49 58 00)
+    bool    m_trigger_answered = false;  // seat / window heating: the BCU answered the trigger (49 58 <flag>)
+    uint8_t m_heat_missing  = 0;      // seat / window heating start: requested heater bits not started
     bool    m_error         = false;  // BCU returned a BAP ERROR response to the request
     bool    m_tx_fail       = false;  // a CAN write failed and the BCU was never heard
     uint8_t m_wake_hold     = 0;      // Ticker1 countdown for the NM-wake bridge (seconds)

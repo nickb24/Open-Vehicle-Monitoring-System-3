@@ -1715,8 +1715,11 @@ void test_climate_arm_clears_window_bits() {
     delete v;
 }
 
+// ClimateState with climate idle and the seat / window heater state running with both windows on.
+static const std::vector<uint8_t> kHeatBothNoClimate = {0x00, 0x00, 0x00, 0x0a, 0x00, 0xbc, 0x30};
+
 // Window heating = the OCU's StartWindowHeating: op 0x04 (no climate, no charge) + op2 front + rear,
-// then the same trigger; confirmed by 49 58 without touching v.e.hvac.
+// then the same trigger; confirmed by the ClimateState heater state without touching v.e.hvac.
 void test_window_heat_sequence() {
     printf("\ntest_window_heat_sequence\n");
     g_metrics = MetricStore{};
@@ -1737,6 +1740,7 @@ void test_window_heat_sequence() {
     CHECK(sent_trigger(kcan(v)), "arm echo releases '29 58 00 01'");
     auto echo = make_kcan_frame(v, BAP_STS_ID, {0x49, 0x58, 0x01});
     v->IncomingFrameCan3(&echo);
+    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, kHeatBothNoClimate);
     CHECK(!hvac_on(), "window heating confirm leaves v.e.hvac alone");
     for (int i = 0; i <= VWEGOLF_BATCTRL_WAKE_SECS + 1; i++) call_ticker1(v, i);
     CHECK(MyNotify.count == 0, "confirmed window heating releases with no notification");
@@ -1806,8 +1810,9 @@ void test_start_refused() {
     CHECK(start_triggers(kcan(v)) == 2, "no Processing: a 49 58 00 does not end the command (trigger re-sent)");
     v->IncomingFrameCan3(&processing);
     v->IncomingFrameCan3(&result_on);
+    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, kHeatBothNoClimate);
     for (int i = 3; i <= VWEGOLF_BATCTRL_WAKE_SECS + 3; i++) call_ticker1(v, i);
-    CHECK(MyNotify.count == 0, "Processing then 49 58 01 confirms with no notification");
+    CHECK(MyNotify.count == 0, "Processing, 49 58 01, heater running: confirmed with no notification");
     delete v;
 }
 
@@ -1836,8 +1841,9 @@ void test_processing_holds_retry() {
     CHECK(start_triggers(kcan(v)) == 2, "Processing stops for 2 s -> trigger re-sent (lost-reply backstop)");
     v->IncomingFrameCan3(&processing);
     v->IncomingFrameCan3(&result_on);
+    inject_bap_status(v, bap::egolf::FUNC_CLIMATE_STATE, kHeatBothNoClimate);
     for (int i = 11; i <= VWEGOLF_BATCTRL_WAKE_SECS + 11; i++) call_ticker1(v, i);
-    CHECK(MyNotify.count == 0, "49 58 01 confirms with no notification");
+    CHECK(MyNotify.count == 0, "49 58 01, heater running: confirmed with no notification");
     delete v;
 
     // Still Processing when the wake window ends: one trigger, and the notification says so.
@@ -1934,6 +1940,128 @@ void test_window_heat_single() {
     v = new OvmsVehicleVWeGolf();
     CHECK(!v->test_batctrl().WindowHeat(true, 0), "no window selected -> refused");
     CHECK(!v->test_batctrl().WindowHeat(true, PO2_PARK_HEATER), "a non-window bit alone -> refused");
+    delete v;
+}
+
+// Seat / window heating is confirmed from the ClimateState heater state (low nibble of byte 5) and the
+// heater bits (byte 6), not from 49 58: during climate the BCU answered a windscreen start with
+// "49 58 01" at once while no heater came on (seen on the car). A matching 49 58 only stops the trigger
+// from being re-sent. Climate (high nibble) plays no part: a rear window start without climate confirms.
+void test_heat_confirm_from_climate_state() {
+    printf("\ntest_heat_confirm_from_climate_state\n");
+    using namespace bap::egolf;
+    const uint8_t F = FUNC_CLIMATE_STATE;
+    const std::vector<uint8_t> climateOnly  = {0x05, 0x00, 0x00, 0x0a, 0x00, 0xcb, 0x00};  // [WIRE]
+    const std::vector<uint8_t> climateRear  = {0x05, 0x00, 0x00, 0x0a, 0x00, 0xcc, 0x20};  // [WIRE]
+    const std::vector<uint8_t> rearAlone    = {0x00, 0x00, 0x00, 0x0a, 0x00, 0xbc, 0x20};  // [WIRE]
+    const std::vector<uint8_t> idle         = {0x00, 0x00, 0x00, 0x0a, 0x00, 0xbb, 0x00};  // [WIRE]
+    const std::vector<uint8_t> bitsNotRun   = {0x00, 0x00, 0x00, 0x0a, 0x00, 0xbb, 0x20};  // heater idle, bit set
+    const std::vector<uint8_t> seatFl       = {0x05, 0x00, 0x00, 0x0a, 0x00, 0xcc, 0x01};
+
+    // Windscreen during climate: immediate 49 58 01, the heater state never runs -> failed, one trigger.
+    g_metrics = MetricStore{};
+    MyNotify = OvmsNotify{};
+    auto* v = new OvmsVehicleVWeGolf();
+    auto on  = make_kcan_frame(v, BAP_STS_ID, {0x49, 0x58, 0x01});
+    auto off = make_kcan_frame(v, BAP_STS_ID, {0x49, 0x58, 0x00});
+    inject_bap_status(v, F, climateOnly);
+    CHECK(v->test_batctrl().WindowHeat(true, PO2_WINDOW_HEATER_FRONT), "windscreen start accepted");
+    arm_record(v, 0x06, 0x00);
+    inject_arm_echo(v);
+    v->IncomingFrameCan3(&on);
+    for (int i = 1; i <= VWEGOLF_BATCTRL_WAKE_SECS + 1; i++) {
+        if (i % 13 == 1) inject_bap_status(v, F, climateOnly);
+        call_ticker1(v, i);
+    }
+    CHECK(start_triggers(kcan(v)) == 1, "answered trigger is not re-sent");
+    CHECK(MyNotify.count == 1 && MyNotify.last_type == "alert" && MyNotify.last_value ==
+          "WindowHeat command failed: not started by the car (the heater did not come on)",
+          "49 58 01 without the heater running -> failed");
+    delete v;
+
+    // Both windows during climate, only the rear runs -> success with an info note.
+    g_metrics = MetricStore{};
+    MyNotify = OvmsNotify{};
+    v = new OvmsVehicleVWeGolf();
+    on = make_kcan_frame(v, BAP_STS_ID, {0x49, 0x58, 0x01});
+    inject_bap_status(v, F, climateOnly);
+    CHECK(v->test_batctrl().WindowHeat(true, kBothWindows), "both-window start accepted");
+    arm_record(v, 0x06, 0x00);
+    inject_arm_echo(v);
+    v->IncomingFrameCan3(&on);
+    inject_bap_status(v, F, climateRear);
+    CHECK(hvac_on(), "climate stays on");
+    for (int i = 1; i <= VWEGOLF_BATCTRL_WAKE_SECS + 1; i++) call_ticker1(v, i);
+    CHECK(MyNotify.count == 1 && MyNotify.last_type == "info" && MyNotify.last_subtype == "xvg.climate" &&
+          MyNotify.last_value == "Window heating on: rear window; not started by the car: front window",
+          "partial start -> info note naming the window the car did not start");
+    delete v;
+
+    // Rear window without climate (heater bit set, heater state idle first: not enough) -> confirmed.
+    g_metrics = MetricStore{};
+    MyNotify = OvmsNotify{};
+    v = new OvmsVehicleVWeGolf();
+    on = make_kcan_frame(v, BAP_STS_ID, {0x49, 0x58, 0x01});
+    CHECK(v->test_batctrl().WindowHeat(true, PO2_WINDOW_HEATER_REAR), "rear start accepted");
+    arm_record(v, 0x06, 0x00);
+    inject_arm_echo(v);
+    inject_bap_status(v, F, bitsNotRun);
+    call_ticker1(v, 1);
+    call_ticker1(v, 2);
+    CHECK(start_triggers(kcan(v)) == 2, "heater bit with the heater state idle: not confirmed (trigger re-sent)");
+    inject_bap_status(v, F, rearAlone);
+    v->IncomingFrameCan3(&on);
+    CHECK(!hvac_on(), "rear window alone leaves v.e.hvac off");
+    for (int i = 3; i <= VWEGOLF_BATCTRL_WAKE_SECS + 3; i++) call_ticker1(v, i);
+    CHECK(MyNotify.count == 0, "rear window running without climate: confirmed, no notification");
+    delete v;
+
+    // Stop: 49 58 00 alone doesn't confirm; the heater state leaving "running" does.
+    g_metrics = MetricStore{};
+    MyNotify = OvmsNotify{};
+    v = new OvmsVehicleVWeGolf();
+    off = make_kcan_frame(v, BAP_STS_ID, {0x49, 0x58, 0x00});
+    CHECK(v->test_batctrl().WindowHeat(false, PO2_WINDOW_HEATER_REAR), "rear stop accepted");
+    arm_record(v, 0x04, 0x02);  // no ClimateState heard yet -> arm + stop
+    inject_arm_echo(v);
+    v->IncomingFrameCan3(&off);
+    inject_bap_status(v, F, rearAlone);  // a heartbeat from before the stop
+    call_ticker1(v, 1);
+    inject_bap_status(v, F, idle);
+    for (int i = 2; i <= VWEGOLF_BATCTRL_WAKE_SECS + 2; i++) call_ticker1(v, i);
+    CHECK(MyNotify.count == 0, "stop confirmed once the heater state is idle");
+    delete v;
+
+    // Stop that the car never carries out -> "not stopped by the car".
+    g_metrics = MetricStore{};
+    MyNotify = OvmsNotify{};
+    v = new OvmsVehicleVWeGolf();
+    off = make_kcan_frame(v, BAP_STS_ID, {0x49, 0x58, 0x00});
+    CHECK(v->test_batctrl().WindowHeat(false, PO2_WINDOW_HEATER_REAR), "rear stop accepted");
+    arm_record(v, 0x04, 0x02);
+    inject_arm_echo(v);
+    v->IncomingFrameCan3(&off);
+    for (int i = 1; i <= VWEGOLF_BATCTRL_WAKE_SECS + 1; i++) {
+        if (i % 13 == 1) inject_bap_status(v, F, climateRear);
+        call_ticker1(v, i);
+    }
+    CHECK(MyNotify.count == 1 && MyNotify.last_value ==
+          "WindowHeat command failed: not stopped by the car (the heater is still on)", "heater still on -> failed");
+    delete v;
+
+    // Seat heating: confirmed only with the seat bit and the heater state running.
+    g_metrics = MetricStore{};
+    MyNotify = OvmsNotify{};
+    v = new OvmsVehicleVWeGolf();
+    on = make_kcan_frame(v, BAP_STS_ID, {0x49, 0x58, 0x01});
+    CHECK(v->test_batctrl().SeatHeat(true, PO_SEAT_FL), "seat start accepted");
+    arm_record(v, 0x06, 0x00);
+    inject_arm_echo(v);
+    v->IncomingFrameCan3(&on);
+    inject_bap_status(v, F, climateOnly);
+    inject_bap_status(v, F, seatFl);
+    for (int i = 1; i <= VWEGOLF_BATCTRL_WAKE_SECS + 1; i++) call_ticker1(v, i);
+    CHECK(MyNotify.count == 0, "seat heater running with its bit: confirmed");
     delete v;
 }
 
@@ -2487,6 +2615,7 @@ void test_bat_ctrl_all() {
     test_climate_arm_clears_window_bits();
     test_window_heat_sequence();
     test_window_heat_single();
+    test_heat_confirm_from_climate_state();
     test_start_refused();
     test_processing_holds_retry();
     test_heat_stop_when_idle();
