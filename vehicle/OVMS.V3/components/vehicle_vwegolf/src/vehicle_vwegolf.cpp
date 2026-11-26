@@ -69,7 +69,7 @@ OvmsVehicleVWeGolf::OvmsVehicleVWeGolf() {
 
     // FCAN (CAN2), listen-only, as a fallback for charging: the car keeps AC charging with KCAN asleep,
     // and FCAN then still carries the BCU status (0x17332510) and the charge / battery frames, with the
-    // same payloads as on KCAN (fcan-all.crtd, 2026-10-18). Listen mode never transmits, so it can't wake
+    // same payloads as on KCAN (seen on the car). Listen mode never transmits, so it can't wake
     // or disturb the bus. FCAN runs ~900 frames/s; the MCP2515 hardware filter passes only that set
     // (~70/s), see SetFcanFilter(). Frames are used only while KCAN is idle (IncomingFrameCan2).
     RegisterCanBus(2, CAN_MODE_LISTEN, CAN_SPEED_500KBPS);
@@ -211,7 +211,7 @@ void OvmsVehicleVWeGolf::SetFcanFilter() {
     cfg.filter[1] = cfg.filter[0];
     // Mask 1 / filters 2-5 (RX buffer 1): standard ids with the low nibble don't-care. The EID mask
     // stays 0, so data bytes 0-1 are not compared. On FCAN each pattern matches only wanted frames:
-    // 0x13x = 0x131, 0x19x = 0x191, 0x59x = 0x594 + 0x59E, 0x5Cx = 0x5CA (fcan-all.crtd). Range
+    // 0x13x = 0x131, 0x19x = 0x191, 0x59x = 0x594 + 0x59E, 0x5Cx = 0x5CA (seen on the car). Range
     // (0x5F5) doesn't fit, so it only updates while KCAN is awake.
     cfg.mask[1].b.sid = 0x7F0;
     cfg.filter[2].b.sid = 0x130;
@@ -951,7 +951,7 @@ void OvmsVehicleVWeGolf::DecodeFrame(CAN_frame_t* p_frame) {
         case 0x32A:  // LH_EPS_01: steering
         {
             // d[5] bits 1-2: steering side. 1 = left-hand drive (seen on-car), 2 = right-hand drive (OEM
-            // OCU firmware; confirmed on a UK RHD car 2026-11-25: the driver's window showed as fr). Other
+            // OCU firmware; confirmed on a UK RHD car: the driver's window showed as fr). Other
             // values keep the last known side.
             if (p_frame->FIR.B.DLC < 6) break;
             const uint8_t side = (d[5] >> 1) & 0x3;
@@ -1000,7 +1000,7 @@ void OvmsVehicleVWeGolf::DecodeFrame(CAN_frame_t* p_frame) {
 
 // v.e.locked: the locking mode (0x583 d[7]) is locked and every door reports itself locked. On a car
 // locked from inside, pulling a door's inside handle unlocks only that door while the mode stays
-// locked (on-car 2026-11-22); the mode alone would then still read "locked".
+// locked (seen on the car); the mode alone would then still read "locked".
 void OvmsVehicleVWeGolf::UpdateLocked() {
     if (m_lock_mode < 0) return;
     bool locked = m_lock_mode == 1;

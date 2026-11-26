@@ -40,9 +40,9 @@
 #define VWEGOLF_NM_WAKE_NODE       0x7D  // spare node id (verified unused in captures)
 #define VWEGOLF_BATCTRL_WAKE_SECS  20    // max seconds to sustain the NM-wake bridge
 #define VWEGOLF_BATCTRL_RETRY_SECS 2     // backstop: re-send a step only if its reply is lost this long
-// The profile-array replies are slow: the arm write's ack (49 59 bx) took up to 1.35 s on-car
-// (2026-10-27), and the 119-byte profile 0 read reply (17 segments at ~50 ms, interleaved with other
-// BCU arrays) took 1.85 s (2026-10-28). The 1 Hz backstop counts whole ticks, so a 2 s wait can fire
+// The profile-array replies are slow: the arm write's ack (49 59 bx) took up to 1.35 s on-car,
+// and the 119-byte profile 0 read reply (17 segments at ~50 ms, interleaved with other BCU arrays)
+// took 1.85 s. The 1 Hz backstop counts whole ticks, so a 2 s wait can fire
 // after only ~1 s and re-send under a reply still arriving. Wait longer for these two (effective 2-3 s).
 #define VWEGOLF_BATCTRL_ARRAY_REPLY_SECS 3
 // Lost-reply backstop toggle. 1 = re-send the current step if its reply is lost (robust: replies and
@@ -100,7 +100,7 @@ class VWeGolfBatteryControl {
                                            // the arm clears the window heater bits, as the OCU does.
     // Window heating, the OCU's separate StartWindowHeating sequence: profile 0 armed op 0x04 / op2 =
     // `windows` (PO2_WINDOW_HEATER_FRONT / _REAR mask, no climate bit), then the same 29 58 trigger.
-    // Both windows = the OCU's own arm [WIRE 2026-10-27: rear powered, windscreen dropped above 4 °C,
+    // Both windows = the OCU's own arm [WIRE: rear powered, windscreen dropped above 4 °C,
     // runs alongside cabin climate]. One window = TEST: the OCU never arms just one, so whether the BCU
     // starts only that heater, and whether OFF stops only that one (the BCU has a single seat/window
     // heater state), is unknown.
@@ -391,7 +391,7 @@ class VWeGolfBatteryControl {
     uint8_t  m_hs_state           = 0xFF;  // last seatheaterWindowState (resets on sleep like m_cs_state)
     uint8_t  m_cs_age             = 0xFF;  // seconds since the last ClimateState (saturates at 255)
     // The BCU reported "power reduction" for ~2 s in a running climate session, then "running" again
-    // [WIRE 2026-11-24]; climate kept running. A held abort that turns back into "running" is only
+    // [WIRE]; climate kept running. A held abort that turns back into "running" is only
     // logged. Longer than one ClimateState heartbeat (~13 s), so the BCU has repeated the state.
     static constexpr uint8_t kAbortHoldSecs = 15;
     HeldAbort m_cs_abort;                  // climate state machine

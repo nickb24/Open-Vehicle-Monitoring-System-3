@@ -50,7 +50,7 @@
 // one BCU heartbeat (~13 s). The 0x5A7 frame stops with it.
 #define VWEGOLF_WAKE_HOLD_SECS 10
 // `wakeup` reports success once the BCU is heard on KCAN; it answers ~0.3 s after the wake frame
-// gets through (6 of 8 wake captures).
+// gets through (seen on the car).
 #define VWEGOLF_WAKE_ANSWER_MS 3000
 
 class OvmsVehicleVWeGolf : public OvmsVehicle {

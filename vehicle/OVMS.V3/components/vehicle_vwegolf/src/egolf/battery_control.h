@@ -240,7 +240,7 @@ inline bool decodeTimer(const uint8_t* rec, uint16_t len, Timer& out) {
 
 // TimerState (func 0x13): 2-byte body {enabledMask, expiredMask}; bit i => timer (i+1)
 // programmed/enabled. [FW+WIRE] Byte 1 is baphandler's bap_expired_timer [FW]: read 01 while a
-// timer-1 charge ran, 00 idle [WIRE 2026-10-18]. Writes send 0x00 there.
+// timer-1 charge ran, 00 idle [WIRE]. Writes send 0x00 there.
 inline size_t encodeTimerState(uint8_t* out, size_t cap, uint8_t enabledMask) {
   if (cap < 2) return 0;
   out[0] = (uint8_t)(enabledMask & 0x0F); out[1] = 0x00; return 2;
@@ -577,7 +577,7 @@ enum ClimateHeater : uint8_t {
   CH_SEAT_RL      = 0x04,  // [FW]
   CH_SEAT_RR      = 0x08,  // [FW]
   CH_WINDOW_FRONT = 0x10,  // [WIRE] windscreen heating running
-  CH_WINDOW_REAR  = 0x20,  // [WIRE 2026-10-27] rear window heating running (xvg windowheat)
+  CH_WINDOW_REAR  = 0x20,  // [WIRE] rear window heating running (xvg windowheat)
 };
 
 enum ClimateStateValue : uint8_t {
@@ -634,13 +634,13 @@ inline bool heaterStateIsAbort(uint8_t s) {
 // ChargeState (func 0x11), 9 bytes [WIRE]:
 //   [0]   chargeMode (high nibble, ChargeModeValue) | chargeState (low nibble, ChargeStateValue)
 //   [1]   SOC % (0xFF = unknown, e.g. right after wake) [WIRE: matched the car at 82 % and 62 %]
-//   [2-3] remaining charge time, minutes, u16le; 0xFFFF = none [WIRE 2026-10-18, AC charging: counted
+//   [2-3] remaining charge time, minutes, u16le; 0xFFFF = none [WIRE, AC charging: counted
 //         down 190 -> 175, while 0x594's time-to-full read 170 min a few minutes later]
 //   [4-7] not decoded (ff ff 00 ff so far)
 //   [8]   startReason (high nibble) | batteryClimateState (low nibble) [FW: baphandler]. Read 0x01 idle
-//         and 0x11 during a timer-1 charge [WIRE 2026-10-18]: startReason 1 fits the DSI enum (1 = timer
+//         and 0x11 during a timer-1 charge [WIRE]: startReason 1 fits the DSI enum (1 = timer
 //         1, 5 = immediately), not the tracker reading "1 = immediate", so the DSI names are used.
-//         Confirmed [WIRE 2026-11-24]: 0x21 during timer-2 charges, 0x51 after `charge start`.
+//         Confirmed [WIRE]: 0x21 during timer-2 charges, 0x51 after `charge start`.
 constexpr uint16_t kChargeStateMinLen = 2;
 constexpr uint16_t kChargeStateLen = 9;
 
@@ -717,8 +717,8 @@ size_t plugSupplyName(uint8_t v, char* out, size_t cap);
 size_t plugStateName(uint8_t v, char* out, size_t cap);
 
 // GetAll (func 0x01) reply: every property value in function order, concatenated. Values longer than
-// 6 bytes carry a u16le length prefix; shorter ones are fixed-size [WIRE: the 79-byte reply of
-// 2026-10-16/18]. Finds `func`'s value (*val / *vlen). Returns false unless the whole body parses
+// 6 bytes carry a u16le length prefix; shorter ones are fixed-size [WIRE: a 79-byte
+// reply]. Finds `func`'s value (*val / *vlen). Returns false unless the whole body parses
 // exactly against this BCU's property list (0x02-0x04, 0x0D-0x16), so a BCU with a different list is
 // ignored rather than misread.
 bool findGetAllValue(const uint8_t* body, uint16_t len, uint8_t func, const uint8_t** val,

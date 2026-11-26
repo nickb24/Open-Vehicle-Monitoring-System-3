@@ -923,7 +923,7 @@ void test_list_profiles_readonly() {
     auto* v = new OvmsVehicleVWeGolf();
 
     // No Ticker1 call anywhere in this test: the read must complete with the tick stalled, as it is
-    // while an MQTT command blocks the network task (2026-11-24 15:36: the wake was never repeated).
+    // while an MQTT command blocks the network task (seen on the car: the wake was never repeated).
     CHECK(v->test_batctrl().ListProfiles(), "ListProfiles() accepted (no command in flight)");
     CHECK(ext_frames(kcan(v), NM_WAKE_ID).size() == 2,
           "both wake frames sent by the command itself, before any tick");
@@ -1090,12 +1090,12 @@ void test_set_profile_flags_preserve_other_bits() {
 static std::string str_metric(const char* name) { return g_metrics.strings[name]; }
 static bool bool_metric(const char* name) { return g_metrics.numbers[name] != 0.0; }
 
-// Real bodies from the 2026-10-16/18 captures.
-static const std::vector<uint8_t> kCsIdle     = {0x00, 0x00, 0x00, 0x0a, 0x00, 0xbb, 0x00};  // clim-a
-static const std::vector<uint8_t> kCsIgnition = {0x00, 0x00, 0x00, 0x0a, 0x00, 0x2b, 0x00};  // bap25-1
-static const std::vector<uint8_t> kCsRunning  = {0x11, 0x00, 0x00, 0x0a, 0x00, 0xcb, 0x00};  // clim-b
-static const std::vector<uint8_t> kCsWindow   = {0x11, 0x00, 0x00, 0x0a, 0x00, 0xcc, 0x10};  // klima-b
-// The 79-byte GetAll reply at wake (fw-bug, 2026-10-18).
+// Real bodies recorded on the car.
+static const std::vector<uint8_t> kCsIdle     = {0x00, 0x00, 0x00, 0x0a, 0x00, 0xbb, 0x00};  // idle
+static const std::vector<uint8_t> kCsIgnition = {0x00, 0x00, 0x00, 0x0a, 0x00, 0x2b, 0x00};  // ignition on
+static const std::vector<uint8_t> kCsRunning  = {0x11, 0x00, 0x00, 0x0a, 0x00, 0xcb, 0x00};  // climate running
+static const std::vector<uint8_t> kCsWindow   = {0x11, 0x00, 0x00, 0x0a, 0x00, 0xcc, 0x10};  // climate + windscreen heating running
+// The 79-byte GetAll reply at a wake.
 static const std::vector<uint8_t> kGetAll = {
     0x03, 0x00, 0x25, 0x00, 0x04, 0x00,                                // 0x02 BAP_Config
     0x08, 0x00, 0x78, 0x07, 0xfe, 0xe0, 0x00, 0x00, 0x00, 0x00,        // 0x03 FunctionList (len 8)
@@ -1111,7 +1111,7 @@ static const std::vector<uint8_t> kGetAll = {
     0x08, 0x00, 0xff, 0xff, 0xff, 0x09, 0x00, 0xc0, 0x03, 0x00,        // 0x15 timer 2
     0x08, 0x00, 0x1a, 0x08, 0x08, 0x10, 0x05, 0x01, 0x02, 0x00,        // 0x16 timer 3
 };
-// The GetAll at a wake while AC charging carries real values (wake-charging, 2026-11-20): plugged,
+// The GetAll at a wake while AC charging carries real values: plugged,
 // supply active; ChargeState AC running, SOC 79 %, 160 min remaining.
 static const std::vector<uint8_t> kGetAllCharging = {
     0x03, 0x00, 0x25, 0x00, 0x04, 0x00,                                // 0x02 BAP_Config
@@ -1333,8 +1333,8 @@ void test_status_abort_notifications() {
     delete v;
 }
 
-// A seat / window heating state that is not defined for it ("unknown (N)") is only logged. The false
-// alert of 2026-11-22 10:07 ("Window/seat heating not started: unknown (14)") came from such a value,
+// A seat / window heating state that is not defined for it ("unknown (N)") is only logged. A false
+// alert seen on the car ("Window/seat heating not started: unknown (14)") came from such a value,
 // read from a ClimateState stitched together from two telegrams.
 void test_heater_unknown_state_no_alert() {
     printf("\ntest_heater_unknown_state_no_alert\n");
@@ -1356,7 +1356,7 @@ void test_heater_unknown_state_no_alert() {
 }
 
 // The BCU reported "power reduction" for ~2 s in a running climate session, then "running" again,
-// while climate kept running [WIRE 2026-11-24, capture reasm-3-climate-on]. An abort that turns back
+// while climate kept running [WIRE]. An abort that turns back
 // into running within the 15 s hold is only logged; one that stays is notified; the driver getting
 // in drops it; a later abort value replaces the held one.
 void test_climate_abort_held() {
@@ -1466,7 +1466,7 @@ void test_status_from_getall_and_sleep() {
           "placeholder GetAll -> charge state not taken");
     CHECK(str_metric("xvg.v.c.plug.state") == "no data", "placeholder GetAll -> plug state not taken");
 
-    // wake-full-2 order: the correct PlugState status, then the placeholder GetAll, then ChargeState.
+    // Order seen on the car: the correct PlugState status, then the placeholder GetAll, then ChargeState.
     inject_bap_status(v, bap::egolf::FUNC_PLUG_STATE, {0x1f, 0x11});
     inject_bap_status(v, bap::egolf::FUNC_BAP_GETALL, kGetAll);
     CHECK(str_metric("xvg.v.c.plug.state") == "plugged" && str_metric("xvg.v.c.plug.lock") == "locked" &&
@@ -1548,7 +1548,7 @@ void test_fcan_charging_fallback() {
     g_metrics = MetricStore{};
     MyNotify = OvmsNotify{};
     auto* v = new OvmsVehicleVWeGolf();
-    // fcan-all.crtd (2026-10-18, AC charging with KCAN asleep).
+    // Recorded on FCAN while AC charging with KCAN asleep.
     const std::initializer_list<uint8_t> charging594 = {0x00, 0xf0, 0x21, 0xe3, 0x01, 0x34, 0x30, 0x0e};
     const std::initializer_list<uint8_t> soc131      = {0x00, 0x00, 0x00, 0x98, 0x00, 0x00, 0xd0, 0xff};
 
@@ -1710,8 +1710,8 @@ static int start_triggers(canbus* bus) {
     return n;
 }
 
-// A START the BCU processes and then reports failed (39 58 Processing, then 49 58 00 — the front-only
-// window heating of 2026-10-28) ends the command at once: no more triggers, one notification. Without
+// A START the BCU processes and then reports failed (39 58 Processing, then 49 58 00 — e.g. a
+// front-window-only start) ends the command at once: no more triggers, one notification. Without
 // a Processing indication a "49 58 00" is not taken as a refusal; Processing then 01 confirms.
 void test_start_refused() {
     printf("\ntest_start_refused\n");
@@ -1984,7 +1984,7 @@ static int profile_gets(canbus* bus) {
     return n;
 }
 
-// The profile 0 read reply took 1.85 s on-car (2026-10-28) and the 2 s backstop re-sent the GET under
+// The profile 0 read reply took 1.85 s on-car and the 2 s backstop re-sent the GET under
 // it; the read now waits 3 ticks like the arm ack, and a lost reply is still re-requested.
 void test_profile_read_wait() {
     printf("\ntest_profile_read_wait\n");

@@ -500,7 +500,7 @@ void VWeGolfBatteryControl::IncomingBapStatus(const CAN_frame_t* p_frame) {
     // Each Processing restarts the lost-reply backstop: the trigger arrived, so it is not re-sent
     // while the BCU works on it. The OCU sends 29 58 exactly once and never re-sends it during
     // Processing (baphandler bap_handle_immediately_control_stm); the BCU times its answer from the
-    // first trigger anyway (refusals at 10.0 s, successes at 4-5 s) [WIRE 2026-10-27/28].
+    // first trigger anyway (refusals at 10.0 s, successes at 4-5 s) [WIRE].
     if (el.opcode == bap::OP_HEARTBEAT && el.func == bap::egolf::FUNC_OPERATION_MODE &&
         m_phase == CP_CONFIRM) {
         m_processing = true;
@@ -575,7 +575,7 @@ void VWeGolfBatteryControl::IncomingBapStatus(const CAN_frame_t* p_frame) {
             if (m_wake_hold > 2) m_wake_hold = 2;  // release soon, small grace
         } else if (started_op && m_phase == CP_CONFIRM && m_enable && el.body[0] == 0 && m_processing) {
             // A START the BCU processed and then reported as failed (Processing 39 58, Result 49 58 00)
-            // — e.g. a front-window-only start, which the car cuts after 5 s [WIRE 2026-10-28]. Stop:
+            // — e.g. a front-window-only start, which the car cuts after 5 s [WIRE]. Stop:
             // re-firing the trigger would only repeat the attempt (each one pulsed the windscreen).
             // Requires the Processing indication, so a stale "49 58 00" can't fail a good start.
             m_refused = true;
@@ -747,7 +747,7 @@ void VWeGolfBatteryControl::IncomingBapStatus(const CAN_frame_t* p_frame) {
                             bap::egolf::rawToTemp(m_profile0.temperatureRaw), Celcius);
                     // Seat / window heating STOP while the BCU reports that heating isn't running: done,
                     // with no arm and no trigger. A stop for an idle heater left the BCU in Processing with
-                    // no Result for 25 s [WIRE 2026-10-28, seat1/seat2]; the OCU checks heaterState first
+                    // no Result for 25 s [WIRE]; the OCU checks heaterState first
                     // and finishes the same way. Needs a fresh ClimateState (the wake GetAll, which arrives
                     // before this reply, carries one); without one the stop goes out as before.
                     if (HeaterAlreadyOff()) {
@@ -817,7 +817,7 @@ void VWeGolfBatteryControl::HandleAmbientStatus(const bap::Element& el) {
     } else if (el.func == bap::egolf::FUNC_BAP_GETALL && el.opcode == bap::OP_STATUS) {
         // Right after a BCU reset (a wake while not charging) the GetAll carries placeholders: PlugState
         // 0f 00 ("unplugged") and ChargeState with SOC 0xFF, sent AFTER the correct PlugState status
-        // [WIRE 2026-11-20, wake-full-2: 1f 11 at +0.89 s, then the GetAll at +1.04 s]. A valid SOC marks
+        // [WIRE: 1f 11 at +0.89 s after the wake, then the GetAll at +1.04 s]. A valid SOC marks
         // a real GetAll (wake while charging: 0f 11 + SOC 79 %); otherwise plug / charge wait for their
         // own status or heartbeat (+0.4 .. +13 s). ClimateState is still taken: it matched the heartbeats
         // at every wake, and HeaterAlreadyOff() needs it before the profile reply.

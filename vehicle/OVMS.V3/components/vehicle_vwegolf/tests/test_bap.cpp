@@ -59,7 +59,7 @@ static const Bytes kCsBody  = {0x00, 0x00, 0x00, 0x0a, 0x00, 0xbb, 0x00};
 static const Bytes kReset   = {0x09, 0x42, 0x03, 0x00, 0x25, 0x00, 0x04, 0x00};
 
 // Profile list (status, fct 0x19) of 119 bytes, ending in "end": 1 start + 17 continuations, whose
-// index runs c0..cf and wraps to c0 for the last one (c0 65 6e 64) [WIRE: 2026-11-22 10:07].
+// index runs c0..cf and wraps to c0 for the last one (c0 65 6e 64) [WIRE].
 static Bytes profile_list_body() {
     Bytes b(119);
     for (size_t i = 0; i < b.size(); i++) b[i] = (uint8_t)(0x20 + i % 64);
@@ -197,12 +197,12 @@ static void test_bap_long_length() {
     CHECK(small.stats().replaced == 1, "the oversize start still clears its group");
 }
 
-// The false alert of 2026-11-22 10:07 ("Window/seat heating not started: unknown (14)"): a
+// A false alert seen on the car ("Window/seat heating not started: unknown (14)"): a
 // ClimateState heartbeat lost its continuation, then the profile list lost one continuation, and the
 // old reassembler completed the stale ClimateState start with the list's last frame (c0 65 6e 64)
 // as 00 00 00 0a 65 6e 64.
-static void test_bap_stitch_1007() {
-    printf("\ntest_bap_stitch_1007\n");
+static void test_bap_stitch_lost_continuation() {
+    printf("\ntest_bap_stitch_lost_continuation\n");
     auto list = frame_of(4, 0x19, profile_list_body());
     std::vector<Bytes> seq = {kCsStart};  // continuation lost
     seq.insert(seq.end(), list.begin(), list.end());
@@ -211,7 +211,7 @@ static void test_bap_stitch_1007() {
     bap::AssemblerT<224, 4> a;
     uint32_t t = 0;
     auto got = feed_all(a, seq, t);
-    CHECK(got.empty(), "10:07 sequence: no element (no stitched ClimateState, no damaged list)");
+    CHECK(got.empty(), "lost continuations: no element (no stitched ClimateState, no damaged list)");
 
     // A stale start (its continuation lost) is not completed by a continuation seconds later.
     bap::AssemblerT<224, 4> c;
@@ -240,6 +240,6 @@ void test_bap_all() {
     test_bap_timeout();
     test_bap_reset();
     test_bap_long_length();
-    test_bap_stitch_1007();
+    test_bap_stitch_lost_continuation();
     test_bap_eviction();
 }

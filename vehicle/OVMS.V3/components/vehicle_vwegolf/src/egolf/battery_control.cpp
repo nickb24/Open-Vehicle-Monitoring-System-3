@@ -205,9 +205,9 @@ const ValueName kClimateStates[] = {
   {CS_IDLE, "idle", true},
   {CS_RUNNING, "running", true},
   {CS_ABORT_NOT_IN_PARK, "aborted: not in park", false},
-  {CS_ABORT_POWER_REDUCTION, "aborted: power reduction", true},  // [WIRE 2026-11-24 + 11-25: for 0.5-2 s,
+  {CS_ABORT_POWER_REDUCTION, "aborted: power reduction", true},  // [WIRE: for 0.5-2 s,
                                                                  //  climate kept running]
-  {CS_COMPLETED, "completed", true},  // [WIRE 2026-11-25: remote climate ended as the car was switched on]
+  {CS_COMPLETED, "completed", true},  // [WIRE: remote climate ended as the car was switched on]
 };
 // seatheaterWindowState uses a subset of the climateState numbers.
 const ValueName kHeaterStates[] = {
@@ -234,11 +234,11 @@ const ValueName kClimateHeaters[] = {
   {CH_SEAT_RL, "seat rear left", false},
   {CH_SEAT_RR, "seat rear right", false},
   {CH_WINDOW_FRONT, "front window", true},
-  {CH_WINDOW_REAR, "rear window", true},  // [WIRE 2026-10-27: 0x20 with 0x588 byte 2 bit 0x10]
+  {CH_WINDOW_REAR, "rear window", true},  // [WIRE: 0x20 with 0x588 byte 2 bit 0x10]
 };
 const ValueName kChargeModes[] = {
   {CHM_OFF, "off", true},
-  {CHM_AC, "AC", true},    // [WIRE 2026-10-18: AC charging]
+  {CHM_AC, "AC", true},    // [WIRE: AC charging]
   {CHM_DC, "DC", false},
   {CHM_CONDITIONING, "conditioning", true},
   {CHM_AC_CONDITIONING, "AC + conditioning", false},
@@ -248,27 +248,27 @@ const ValueName kChargeModes[] = {
 const ValueName kChargeStates[] = {
   {CHS_INIT, "init", false},
   {CHS_IDLE, "idle", true},
-  {CHS_RUNNING, "running", true},  // [WIRE 2026-10-18: AC charging, 0x12]
+  {CHS_RUNNING, "running", true},  // [WIRE: AC charging, 0x12]
   {CHS_CONSERVATION, "conservation", false},
   {CHS_ABORT_TEMP_LOW, "aborted: temperature too low", false},
   {CHS_ABORT_DEVICE_ERROR, "aborted: device error", false},
   {CHS_ABORT_NO_SUPPLY, "aborted: power supply not available", false},
   {CHS_ABORT_NOT_IN_PARK, "aborted: not in park", false},
-  {CHS_COMPLETED, "completed", true},  // [WIRE 2026-11-24: charge ended as the cable was pulled]
+  {CHS_COMPLETED, "completed", true},  // [WIRE: charge ended as the cable was pulled]
 };
 // ChargeState byte 8 high nibble, DSI numbering.
 const ValueName kChargeStartReasons[] = {
   {0, "init", true},         // [WIRE: every reading with no charge running]
-  {1, "timer 1", true},      // [WIRE 2026-10-18: charge for departure timer 1]
-  {2, "timer 2", true},      // [WIRE 2026-11-23/24: charges for departure timer 2]
-  {3, "timer 3", true},      // [WIRE 2026-11-25: 0x31 while departure timer 3 was set in the car]
+  {1, "timer 1", true},      // [WIRE: charge for departure timer 1]
+  {2, "timer 2", true},      // [WIRE: charges for departure timer 2]
+  {3, "timer 3", true},      // [WIRE: 0x31 while departure timer 3 was set in the car]
   {4, "timer 4", false},
-  {5, "immediately", true},  // [WIRE 2026-11-24: after `charge start`]
+  {5, "immediately", true},  // [WIRE: after `charge start`]
   {6, "push button", false},
 };
 const ValueName kPlugLockSetups[] = {
   {0, "unlocked", true},
-  {1, "locked", true},     // [WIRE 2026-10-18: cable locked while charging]
+  {1, "locked", true},     // [WIRE: cable locked while charging]
   {15, "init", false},
 };
 const ValueName kPlugLockStates[] = {
@@ -278,13 +278,13 @@ const ValueName kPlugLockStates[] = {
 };
 const ValueName kPlugSupplies[] = {
   {0, "inactive", true},
-  {1, "active", true},     // [WIRE 2026-10-18: while charging]
+  {1, "active", true},     // [WIRE: while charging]
   {2, "charging station connected", false},
   {15, "init", false},
 };
 const ValueName kPlugStates[] = {
   {0, "unplugged", true},
-  {1, "plugged", true},   // [WIRE 2026-10-18: car plugged in and charging]
+  {1, "plugged", true},   // [WIRE: car plugged in and charging]
   {15, "init", false},
 };
 }  // namespace

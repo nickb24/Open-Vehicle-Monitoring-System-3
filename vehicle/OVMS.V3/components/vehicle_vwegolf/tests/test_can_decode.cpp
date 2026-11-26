@@ -66,8 +66,8 @@ void test_soc_0x131() {
     delete v;
 }
 
-// v.e.locked from 0x583 d[7] (0x80 locked / 0x40 unlocked). Frames are real KCAN captures
-// (2026-11-12 / 2026-11-20); d[2] is the lock-state value that the old decode read bit 1 of.
+// v.e.locked from 0x583 d[7] (0x80 locked / 0x40 unlocked). Frames are recorded on the
+// car; d[2] is the lock-state value that the old decode read bit 1 of.
 // v.e.locked also needs every door locked: the front doors report theirs in 0x3D0 / 0x3D1 (fed
 // first, locked), the rear doors in 0x583 d[6] (0x57 = both locked).
 void test_lock_0x583() {
@@ -116,8 +116,7 @@ void test_lock_0x583() {
 }
 
 // Car locked from inside, then one door unlocked by pulling its inside handle: only that door's lock
-// bit clears, 0x583 d[7] stays 0x80 (locked) and d[2] goes 0x05 -> 0x04. Real KCAN frames, LHD car,
-// 2026-11-22 (capture unlock-modes).
+// bit clears, 0x583 d[7] stays 0x80 (locked) and d[2] goes 0x05 -> 0x04. Real KCAN frames, LHD car.
 void test_lock_inside_handle() {
     printf("\ntest_lock_inside_handle\n");
     auto* v = make_vehicle();
@@ -162,9 +161,9 @@ void test_lock_inside_handle() {
     delete v;
 }
 
-// Body signals: windows, per-door locks, bonnet, side lights, steering side. Frames are real KCAN
-// captures (2026-11-12 / 2026-11-20, LHD car) except the RHD 0x32A value, which comes from the OEM OCU
-// firmware and has not been seen on a car.
+// Body signals: windows, per-door locks, bonnet, side lights, steering side. Frames are recorded on
+// an LHD car, except the RHD 0x32A value, which comes from the OEM OCU firmware (RHD was confirmed on
+// a car from its metrics; the frame itself was not recorded).
 static double num(const char* name) { return g_metrics.numbers[name]; }
 
 void test_body_signals() {
@@ -204,7 +203,7 @@ void test_body_signals() {
           "all unlocked, rear driver side door open -> rr unlocked, v.d.rl open");
 
     // Bonnet: d[3] bit 7 is the switch; d[4] bit 0 follows 10 s later and stayed set after closing with
-    // the ignition off (body-check, 2026-11-20).
+    // the ignition off (seen on the car).
     feed(0x65A, {0x00, 0x00, 0x00, 0x88, 0x00, 0x00, 0x3c, 0x00});  // release pulled: popped open
     CHECK(num("ms_v_door_hood") == 1, "bonnet released -> v.d.hood open at once");
     feed(0x65A, {0x00, 0x00, 0x00, 0x88, 0x01, 0x00, 0x3c, 0x00});  // 10 s later: d[4] bit 0 too
