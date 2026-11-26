@@ -115,10 +115,9 @@ Metric                           Meaning
   door. Each door reports its own lock state: the per-door lock metrics show which doors are unlocked, and
   ``v.e.locked`` reads ``no`` as soon as one door is unlocked
 * Left / right: the car reports doors, windows and locks per driver / passenger side. OVMS maps them to left / right
-  using ``xvg.v.rhd``. This was verified on a left-hand-drive car only; the right-hand-drive mapping follows the OEM
-  telematics unit's firmware. Owners of right-hand-drive cars: please report in a
-  `GitHub issue <https://github.com/openvehicles/Open-Vehicle-Monitoring-System-3/issues>`_ whether ``xvg.v.rhd``
-  reads ``yes`` and whether the doors and windows show on the correct side
+  using ``xvg.v.rhd``. Verified on a left-hand-drive car and on a right-hand-drive car (UK); please report
+  anything shown on the wrong side in a
+  `GitHub issue <https://github.com/openvehicles/Open-Vehicle-Monitoring-System-3/issues>`_
 
 ---------------------
 Cabin Climate Control

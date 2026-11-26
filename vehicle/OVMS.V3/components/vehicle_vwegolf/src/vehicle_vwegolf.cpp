@@ -942,7 +942,8 @@ void OvmsVehicleVWeGolf::DecodeFrame(CAN_frame_t* p_frame) {
         case 0x32A:  // LH_EPS_01: steering
         {
             // d[5] bits 1-2: steering side. 1 = left-hand drive (seen on-car), 2 = right-hand drive (OEM
-            // OCU firmware; not yet seen on a car). Other values keep the last known side.
+            // OCU firmware; confirmed on a UK RHD car 2026-11-25: the driver's window showed as fr). Other
+            // values keep the last known side.
             if (p_frame->FIR.B.DLC < 6) break;
             const uint8_t side = (d[5] >> 1) & 0x3;
             if (side == 1 || side == 2) {
