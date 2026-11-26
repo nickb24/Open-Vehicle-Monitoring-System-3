@@ -887,12 +887,21 @@ void OvmsVehicleVWeGolf::DecodeFrame(CAN_frame_t* p_frame) {
                 // ESP_LOGV(TAG, "0x06B7 parktime=%u", tmp_u32);
             }
 
-            tmp_u8 = ((uint8_t)(d[7] & 0xff) << 0) |
-                     0;  // outerTemp Faktor 0.5 Offset -50, Minimum -50, Maximum 75 [°C] Initial 77
-            tmp_u8 = (uint8_t)tmp_u8;
-            tmp_f32 = ((float)tmp_u8) * 0.5F - 50.0F;
-            StandardMetrics.ms_v_env_temp->SetValue(tmp_f32);  // working
-            // ESP_LOGV(TAG, "0x06B7 outside=%.1f°C", tmp_f32);
+            // Outside temperature filtered by the cluster (the value the dashboard shows): byte 7, raw x 0.5 - 50 °C.
+            // Byte 6 bit 7 marks it invalid (set on the first frame after a wake); raw 0xFD-0xFF = unsupported /
+            // invalid / error. Like the OEM telematics unit, use it only while terminal 15 is on; while it is off,
+            // v.e.temp comes from the unfiltered sensor value in 0x5E1.
+            if (m_kl15_on && !(d[6] & 0x80) && d[7] < 0xFD)
+                StandardMetrics.ms_v_env_temp->SetValue(d[7] * 0.5F - 50.0F);
+            break;
+        }
+        case 0x5E1:  // Klima_Sensor_02: outside temperature sensor, unfiltered
+        {
+            // Byte 0, raw x 0.5 - 50 °C; 0xFD-0xFF = unsupported / invalid / error. Used for v.e.temp while terminal
+            // 15 is off, as the OEM telematics unit does (the filtered 0x6B7 value while it is on).
+            if (p_frame->FIR.B.DLC < 1) break;
+            if (!m_kl15_on && d[0] < 0xFD)
+                StandardMetrics.ms_v_env_temp->SetValue(d[0] * 0.5F - 50.0F);
             break;
         }
         case 0x391:  // OBD_01: drivetrain READY status

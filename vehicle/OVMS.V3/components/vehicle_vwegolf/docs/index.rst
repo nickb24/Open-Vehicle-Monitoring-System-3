@@ -135,6 +135,9 @@ Cabin Climate Control
 * With window heating included in a climate start, the windscreen only heated below 4 °C outside, as set in the
   HVAC module (08) adaptation "IDE07303-Rem.start funct.:activ.temper. of windshield defrost.heat." (default 4 °C).
   Whether this also applies to ``xvg windowheat`` is not yet known
+* The outside temperature ``v.e.temp`` comes from the outside sensor's unfiltered value while the car is switched off,
+  and from the instrument cluster's filtered value (the one on the dashboard) while it is on, as in VW's own
+  telematics unit
 * ``xvg seatheat on`` / ``off`` ``[front|fl|fr]`` is an experimental remote seat heating command. The seat setting
   stays stored in the car until ``xvg seatheat clear``. On right-hand-drive cars ``fl`` is the passenger seat
 * The metrics ``xvg.v.env.heated_front_window`` and ``xvg.v.env.heated_rear_window`` show whether window heating

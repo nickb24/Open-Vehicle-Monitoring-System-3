@@ -310,6 +310,51 @@ void test_charging12v() {
     delete v;
 }
 
+// Outside temperature (v.e.temp), as the OEM telematics unit uses it: unfiltered 0x5E1 byte 0 while terminal 15
+// is off, the cluster's filtered 0x6B7 byte 7 while it is on. 0x6B7 byte 6 bit 7 = invalid; raw 0xFD-0xFF rejected.
+// Frames recorded on the car (0x5E1 / 0x6B7 at 14.0 and 16.5 °C; 0x3C0 byte 2 = 0x03 with the ignition on).
+void test_outside_temperature() {
+    printf("\ntest_outside_temperature\n");
+    auto* v = make_vehicle();
+    auto rx = [v](uint32_t id, std::initializer_list<uint8_t> b) {
+        auto f = make_frame(id, b);
+        v->IncomingFrameCan3(&f);
+    };
+    auto temp = []() { return StandardMetrics.ms_v_env_temp->AsFloat(); };
+
+    // Terminal 15 off (as after a remote wake): the unfiltered sensor value counts, 0x6B7 does not.
+    rx(0x5E1, {0x80, 0x2a, 0x00, 0x60, 0xfe, 0x00, 0x00, 0x00});
+    CHECK(near(temp(), 14.0f), "KL15 off: 0x5E1 raw 0x80 -> 14.0 C");
+    rx(0x6B7, {0x5c, 0x35, 0xf1, 0x07, 0x00, 0x7e, 0x00, 0x84});
+    CHECK(near(temp(), 14.0f), "KL15 off: filtered 0x6B7 (16.0 C) ignored");
+    rx(0x5E1, {0xfe, 0x2a, 0x00, 0x60, 0xfe, 0x00, 0x00, 0x00});
+    CHECK(near(temp(), 14.0f), "KL15 off: 0x5E1 raw 0xFE (invalid) ignored");
+    rx(0x5E1, {0xff, 0x2a, 0x00, 0x60, 0xfe, 0x00, 0x00, 0x00});
+    CHECK(near(temp(), 14.0f), "KL15 off: 0x5E1 raw 0xFF (error) ignored");
+
+    // Terminal 15 on: the filtered cluster value counts, 0x5E1 does not.
+    rx(0x3C0, {0x00, 0x00, 0x03, 0x00});
+    rx(0x6B7, {0x5c, 0x35, 0xe1, 0x07, 0x00, 0x7e, 0x80, 0x85});
+    CHECK(near(temp(), 14.0f), "KL15 on: 0x6B7 with byte 6 bit 7 (invalid, first frame after wake) ignored");
+    rx(0x6B7, {0x5c, 0x35, 0xf1, 0x07, 0x00, 0x7e, 0x00, 0x85});
+    CHECK(near(temp(), 16.5f), "KL15 on: valid 0x6B7 raw 0x85 -> 16.5 C");
+    rx(0x5E1, {0x80, 0x2a, 0x00, 0x60, 0xfe, 0x00, 0x00, 0x00});
+    CHECK(near(temp(), 16.5f), "KL15 on: unfiltered 0x5E1 (14.0 C) ignored");
+    rx(0x6B7, {0x5c, 0x35, 0xf1, 0x07, 0x00, 0x7e, 0x00, 0xfd});
+    CHECK(near(temp(), 16.5f), "KL15 on: 0x6B7 raw 0xFD (unsupported) ignored");
+
+    // Back to terminal 15 off: the sensor value takes over again.
+    rx(0x3C0, {0x00, 0x00, 0x00, 0x00});
+    rx(0x5E1, {0x80, 0x2a, 0x00, 0x60, 0xfe, 0x00, 0x00, 0x00});
+    CHECK(near(temp(), 14.0f), "KL15 off again: 0x5E1 -> 14.0 C");
+
+    // The odometer in 0x6B7 is still decoded whatever the temperature source.
+    rx(0x6B7, {0x5c, 0x35, 0xf1, 0x07, 0x00, 0x7e, 0x00, 0x85});
+    CHECK(StandardMetrics.ms_v_pos_odometer->AsFloat() > 0.0f, "0x6B7 odometer still decoded with KL15 off");
+
+    delete v;
+}
+
 void test_vin_0x6B4() {
     printf("\ntest_vin_0x6B4\n");
     auto* v = make_vehicle();
@@ -599,6 +644,7 @@ int main() {
     test_speed_0xFD();
     test_gear_0x187_park();
     test_charging12v();
+    test_outside_temperature();
     test_vin_0x6B4();
     test_gps_0x486();
     test_sentinel_filters();
