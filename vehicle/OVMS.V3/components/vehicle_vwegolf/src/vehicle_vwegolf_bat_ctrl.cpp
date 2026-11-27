@@ -337,9 +337,9 @@ void VWeGolfBatteryControl::Ticker1(bool bus_alive) {
                 break;
             case CP_PROFILE:
                 if (isTimerOp()) {
-                    // Re-prompt the timer GETs; the periodic HEARTBEAT broadcast is the real source, so
-                    // this is only a nudge. BC_TIMER_LIST finalizes on the collection window (below);
-                    // SET/ENABLE advance in HandleTimerStatus once the enable mask is heard.
+                    // Re-send the timer GETs (the periodic HEARTBEAT broadcast also fills the cache).
+                    // BC_TIMER_LIST finalizes on the collection window (below); SET/ENABLE advance in
+                    // HandleTimerStatus once the enable mask is heard.
                     SendTimerReads();
                     break;
                 }
@@ -544,8 +544,8 @@ void VWeGolfBatteryControl::IncomingBapStatus(const CAN_frame_t* p_frame) {
     // before the stop trigger, just like ON arms it before the start.
     if (m_phase == CP_HANDSHAKE && el.opcode == bap::OP_STATUS &&
         (el.func == bap::egolf::FUNC_BAP_GETALL || el.func == bap::egolf::FUNC_BAP_CONFIG)) {
-        if (isTimerOp()) SendTimerReads();  // best-effort nudge (BCU has no timer GET handler; the
-                                            // persistent cache from the broadcast is the real source)
+        if (isTimerOp()) SendTimerReads();  // GET what the persistent cache lacks (the broadcast
+                                            // fills it too)
         else             SendProfileGet();  // read profile 0 -> arm the matching op -> trigger
         m_phase = CP_PROFILE;
         m_phase_secs = 0;
@@ -1546,20 +1546,26 @@ bool VWeGolfBatteryControl::SendProfileSetWrite() {
 // ---------------------------------------------------------------------------
 
 bool VWeGolfBatteryControl::SendTimerReads() {
-    // Actively GET the timer table + enable mask using the SAME "80"-SEGMENTED get-all framing that
-    // works for the func-0x19 profile GET: "80 04 19 <0x40|func> <asgTxn> 00 00 04" (header byte1 =
-    // 0x40|func → 0x53 for TimerState, 0x54/55/56 for slots 1-3). A BARE "19 5x" GET is silently
-    // dropped by the BCU (confirmed for func 0x19), so bare GETs never elicited the timer records —
-    // the MIB never GETs timers at all, it rides the periodic broadcast. We do both: this active GET
-    // (in case the BCU has a func-0x1x GET handler) AND collect the HEARTBEAT broadcast (39 5x / 39 53),
-    // which arrives in a burst only every ~11-13 s. Sent on kCanIdCommand (0x17332501) like every other
+    // Actively GET the enable mask + timer table, besides collecting the HEARTBEAT broadcast (39 53 /
+    // 39 5x), which comes only every ~11-13 s. Sent on kCanIdCommand (0x17332501) like every other
     // command — the gatewayed channel that reaches the BCU from our KCAN node.
+    //
+    // TimerState (func 0x13) answers a BARE GET "19 53" at once [WIRE: 49 53 03 00 within a few ms] and
+    // ignores the segmented form below. Only ask while the mask is not cached: the answer is a STATUS
+    // 49 53 like the echo of our mask write, so one arriving after a write could confirm a write whose
+    // target equals the current mask. Without a cached mask no write is in flight (TimerWriteMaybeStart
+    // waits for it).
+    auto sink = [this](const uint8_t* f, uint8_t d) -> bool { return TxFrame(f, d); };
+    if (!m_timer_mask_seen)
+        bap::sendElement(sink, bap::OP_GET, bap::egolf::kLsg, bap::egolf::FUNC_TIMER_STATE, nullptr, 0);
+
+    // The slot records (func 0x14..0x16) answer the "80"-SEGMENTED form also used for the func-0x19
+    // profile GET, "80 04 19 <0x40|func> <asgTxn> 00 00 04", and ignore a bare "19 5x" GET.
     auto get = [this](uint8_t func) {
         uint8_t asgTxn = bap::egolf::asgTxnByte(bap::egolf::kAsgIdOvms, m_txn.next());
         uint8_t frame[8] = {0x80, 0x04, 0x19, (uint8_t)(0x40 | func), asgTxn, 0x00, 0x00, 0x04};
         TxFrame(frame, sizeof(frame));  // kCanIdCommand (0x17332501) — our bus's gatewayed channel
     };
-    get(bap::egolf::FUNC_TIMER_STATE);
     for (uint8_t slot = 1; slot <= kNumTimers; slot++) get(bap::egolf::funcForTimerSlot(slot));
     return true;
 }

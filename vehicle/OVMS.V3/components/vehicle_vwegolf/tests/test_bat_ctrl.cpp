@@ -2564,6 +2564,71 @@ void test_timer_set_uses_cache() {
     delete v;
 }
 
+// Timer GETs on 0x17332501: bare "19 53" for TimerState / segmented "80 04 19 5x .." for slots 1-3.
+struct TimerGets { int bareState = 0, segState = 0, segSlots = 0; };
+static TimerGets timer_gets(canbus* bus) {
+    TimerGets g;
+    for (auto& r : ext_frames(bus, BAP_CMD_ID)) {
+        if (r.len == 2 && r.data[0] == 0x19 && r.data[1] == 0x53) g.bareState++;
+        if (r.len == 8 && r.data[0] == 0x80 && r.data[1] == 0x04 && r.data[2] == 0x19) {
+            if (r.data[3] == 0x53) g.segState++;
+            if (r.data[3] >= 0x54 && r.data[3] <= 0x56) g.segSlots++;
+        }
+    }
+    return g;
+}
+
+// TimerState answers a bare GET and ignores the segmented one; the slots the other way round. The bare
+// GET goes out only while the mask is not cached: its 49 53 answer looks like the echo of a mask write.
+void test_timer_state_plain_get() {
+    printf("\ntest_timer_state_plain_get\n");
+    g_metrics = MetricStore{};
+    MyNotify = OvmsNotify{};
+    auto* v = new OvmsVehicleVWeGolf();
+
+    // Mask not cached: the handshake ack GETs TimerState bare and the slots segmented.
+    CHECK(v->test_batctrl().ListTimers(), "ListTimers() accepted");
+    advance_to_profile_phase(v);
+    TimerGets g = timer_gets(kcan(v));
+    CHECK(g.bareState == 1, "mask not cached: one bare GET 19 53 for TimerState");
+    CHECK(g.segState == 0, "no segmented GET for TimerState (the BCU ignores it)");
+    CHECK(g.segSlots == 3, "segmented GETs for timer slots 1-3 kept");
+
+    // No answer yet: the 2 s retry asks again.
+    kcan(v)->tx_log.clear();
+    tick_secs(v, 2);
+    g = timer_gets(kcan(v));
+    CHECK(g.bareState == 1 && g.segSlots == 3, "retry re-sends 19 53 and the slot GETs");
+
+    // The 49 53 answer fills the cache; later retries no longer ask for the mask.
+    inject_bap_status(v, bap::egolf::FUNC_TIMER_STATE, {0x03, 0x00});
+    CHECK(v->test_batctrl().TimerMaskSeen(), "the 49 53 answer fills the mask cache");
+    kcan(v)->tx_log.clear();
+    tick_secs(v, 2);
+    g = timer_gets(kcan(v));
+    CHECK(g.bareState == 0 && g.segSlots == 3, "mask cached: retry GETs the slots only");
+    delete v;
+
+    // Mask cached, re-setting an enabled slot (target mask = current mask): the write fires from the
+    // cache and no 19 53 goes out, so only the write's own echo can confirm it.
+    g_metrics = MetricStore{};
+    MyNotify = OvmsNotify{};
+    v = new OvmsVehicleVWeGolf();
+    auto sts = make_kcan_frame(v, BAP_STS_ID, {0x49, 0x58, 0x00});
+    v->IncomingFrameCan3(&sts);
+    inject_bap_status(v, bap::egolf::FUNC_TIMER_STATE, {0x01, 0x00});
+    bap::egolf::Timer t;
+    t.hour = 7; t.minute = 30; t.weekdays = 0x3e; t.refId = 1;
+    CHECK(v->test_batctrl().SetTimer(1, t), "SetTimer(1) accepted");
+    advance_to_profile_phase(v);
+    g = timer_gets(kcan(v));
+    CHECK(g.bareState == 0, "mask cached: no 19 53 during a timer write");
+    CHECK(timer_mask_written(kcan(v)) == 0x01, "mask write from the cache (unchanged 0x01)");
+    inject_bap_status(v, bap::egolf::FUNC_TIMER_STATE, {0x01, 0x00});
+    CHECK(v->test_batctrl().ListStatus() == VWeGolfBatteryControl::LIST_READY, "confirmed on the write's echo");
+    delete v;
+}
+
 // ---------------------------------------------------------------------------
 
 void test_bat_ctrl_all() {
@@ -2634,4 +2699,5 @@ void test_bat_ctrl_all() {
     test_timer_set_writes_record_and_mask();
     test_timer_enable_disable_rmw();
     test_timer_set_uses_cache();
+    test_timer_state_plain_get();
 }

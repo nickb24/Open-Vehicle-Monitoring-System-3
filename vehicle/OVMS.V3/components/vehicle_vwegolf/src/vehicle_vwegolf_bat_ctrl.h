@@ -286,7 +286,7 @@ class VWeGolfBatteryControl {
     bool SendProfileSetWrite();  // BC_PROFILE_SET: apply m_prof_edit onto m_prof_base and write it back
 
     // Departure-timer TX (all on kCanIdCommand / 0x17332501, like every other command — see TxFrame).
-    bool SendTimerReads();          // GET-prompt the timer table + mask (best-effort; BCU ignores it)
+    bool SendTimerReads();          // GET the timer table, and the mask while it is not cached
     bool SendTimerRecord();         // write m_timer_write into m_timer_slot (29 5x)
     bool SendTimerMask(uint8_t mask);  // write the TimerState enable mask (29 53)
     // Keep the persistent timer cache current from ANY timer status/broadcast frame (func 0x13 mask /

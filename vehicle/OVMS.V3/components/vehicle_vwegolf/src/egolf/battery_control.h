@@ -272,12 +272,11 @@ bap::SendResult sendTimerState(Sink&& sink, uint8_t enabledMask) {
   return bap::sendElement(sink, bap::OP_SET_GET, kLsg, FUNC_TIMER_STATE, body, 2);
 }
 
-// NB the timer read-back is NOT a bare GET: a bare "19 5x" is silently dropped by the BCU (as with
-// the func-0x19 profile GET), and the factory MIB never GETs timers at all — it rides the BCU's
-// periodic HEARTBEAT broadcast (39 5x / 39 53) plus write echoes (STATUS 49 5x / 49 53). The module's
-// read path collects those broadcasts and additionally issues the "80"-SEGMENTED get-all form
-// ("80 04 19 <0x40|func> <asgTxn> 00 00 04", built raw in VWeGolfBatteryControl::SendTimerReads) in
-// case the BCU has a func-0x1x GET handler. No bare-GET helper is provided (it would just be dropped).
+// NB timer read-back: the factory MIB never GETs timers — it rides the BCU's periodic HEARTBEAT
+// broadcast (39 5x / 39 53) plus write echoes (STATUS 49 5x / 49 53). The module's read path collects
+// those and also GETs (VWeGolfBatteryControl::SendTimerReads): TimerState (0x13) with a bare GET
+// "19 53", the slot records (0x14..0x16) with the "80"-SEGMENTED form "80 04 19 <0x40|func> <asgTxn>
+// 00 00 04" (as for the func-0x19 profile GET); each ignores the other form [WIRE].
 
 // PowerProvider night-rate window (func 0x1A, RecordAddr 2). The RA2 record body
 // (after the array header, which carries `pos`) is 4 bytes: nr = "night rate".
